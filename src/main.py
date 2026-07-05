@@ -23,6 +23,7 @@ from src.actuator import ActuatorController
 from src.state_machine import ANPRStateMachine
 from src.telegram_bot import TelegramNotifier
 from src.command_handler import TelegramCommandHandler
+from src.cleanup import cleanup_old_events
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,9 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    # ── Cleanup old event images ──────────────────────────────
+    cleanup_old_events(cfg)
 
     # ── Start Telegram command listener (daemon thread) ──────
     cmd_handler.start()

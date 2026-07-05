@@ -14,22 +14,30 @@ import yaml
 
 # ── Defaults ────────────────────────────────────────────────
 _DEFAULTS = {
+    "esp32": {
+        "base_url": "",
+        "api_key": "",
+        "stream_path": "/stream",
+        "capture_path": "/capture",
+        "sensor_path": "/distance",
+        "barrier_open_path": "/barrier/open",
+        "barrier_close_path": "/barrier/close",
+        "status_path": "/status",
+        "stream_timeout_sec": 10,
+        "request_timeout_sec": 5,
+    },
     "camera": {
         "resolution_width": 640,
         "resolution_height": 480,
         "capture_count": 5,
-        "warmup_seconds": 2,
+        "warmup_seconds": 0,
     },
     "sensor": {
-        "trigger_pin": 23,
-        "echo_pin": 24,
         "distance_threshold_cm": 50,
         "confirmation_readings": 3,
         "reading_interval_sec": 0.1,
     },
     "actuator": {
-        "servo_pin": 18,
-        "relay_pin": 25,
         "servo_open_angle": 90,
         "servo_closed_angle": 0,
         "open_duration_sec": 10,
@@ -53,11 +61,15 @@ _DEFAULTS = {
     "paths": {
         "database": "data/db/anpr.db",
         "events_dir": "data/events",
+        "event_retention_days": 30,
     },
     "web": {
         "host": "0.0.0.0",
         "port": 5000,
         "debug": False,
+        "secret_key": "",
+        "dashboard_username": "",
+        "dashboard_password": "",
     },
     "logging": {
         "level": "INFO",
@@ -77,17 +89,61 @@ _DEFAULTS = {
 
 # ── Nested Config Dataclasses ───────────────────────────────
 @dataclass
+class Esp32Config:
+    """ESP32-CAM edge device connection settings."""
+    base_url: str = ""
+    api_key: str = ""
+    stream_path: str = "/stream"
+    capture_path: str = "/capture"
+    sensor_path: str = "/distance"
+    barrier_open_path: str = "/barrier/open"
+    barrier_close_path: str = "/barrier/close"
+    status_path: str = "/status"
+    stream_timeout_sec: int = 10
+    request_timeout_sec: int = 5
+
+    @property
+    def auth_headers(self) -> dict:
+        """HTTP headers for authenticating against the ESP32 (empty if no key set)."""
+        return {"X-Api-Key": self.api_key} if self.api_key else {}
+
+    @property
+    def stream_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.stream_path}"
+
+    @property
+    def capture_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.capture_path}"
+
+    @property
+    def sensor_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.sensor_path}"
+
+    @property
+    def barrier_open_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.barrier_open_path}"
+
+    @property
+    def barrier_close_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.barrier_close_path}"
+
+    @property
+    def status_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.status_path}"
+
+
+@dataclass
 class CameraConfig:
+    """Camera capture settings (frames pulled from ESP32 MJPEG stream)."""
     resolution_width: int = 640
     resolution_height: int = 480
     capture_count: int = 5
-    warmup_seconds: int = 2
+    warmup_seconds: int = 0  # Not needed for MJPEG stream
 
 
 @dataclass
 class SensorConfig:
-    trigger_pin: int = 23
-    echo_pin: int = 24
+    """Ultrasonic sensor settings (readings fetched from ESP32 over HTTP)."""
     distance_threshold_cm: int = 50
     confirmation_readings: int = 3
     reading_interval_sec: float = 0.1
@@ -95,8 +151,7 @@ class SensorConfig:
 
 @dataclass
 class ActuatorConfig:
-    servo_pin: int = 18
-    relay_pin: int = 25
+    """Barrier actuator settings (commands sent to ESP32 over HTTP)."""
     servo_open_angle: int = 90
     servo_closed_angle: int = 0
     open_duration_sec: int = 10
@@ -126,6 +181,7 @@ class OcrConfig:
 class PathsConfig:
     database: str = "data/db/anpr.db"
     events_dir: str = "data/events"
+    event_retention_days: int = 30
 
 
 @dataclass
@@ -133,6 +189,9 @@ class WebConfig:
     host: str = "0.0.0.0"
     port: int = 5000
     debug: bool = False
+    secret_key: str = ""
+    dashboard_username: str = ""
+    dashboard_password: str = ""
 
 
 @dataclass
@@ -155,6 +214,7 @@ class TelegramConfig:
 @dataclass
 class AppConfig:
     """Top-level application configuration."""
+    esp32: Esp32Config = field(default_factory=Esp32Config)
     camera: CameraConfig = field(default_factory=CameraConfig)
     sensor: SensorConfig = field(default_factory=SensorConfig)
     actuator: ActuatorConfig = field(default_factory=ActuatorConfig)
@@ -207,6 +267,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     merged = _deep_merge(_DEFAULTS, raw)
 
     cfg = AppConfig(
+        esp32=Esp32Config(**merged["esp32"]),
         camera=CameraConfig(**merged["camera"]),
         sensor=SensorConfig(**merged["sensor"]),
         actuator=ActuatorConfig(**merged["actuator"]),

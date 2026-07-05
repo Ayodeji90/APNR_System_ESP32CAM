@@ -10,8 +10,9 @@ Creates and manages the SQLite database with tables:
 import os
 import sqlite3
 import logging
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Generator
 
 from src.config import AppConfig, resolve_path
 
@@ -68,14 +69,20 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_schema(self) -> None:
+    @contextmanager
+    def _connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Context manager that yields a connection and always closes it."""
         conn = self._connect()
         try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _init_schema(self) -> None:
+        with self._connection() as conn:
             conn.executescript(_SCHEMA_SQL)
             conn.commit()
             logger.info("Database initialised at %s", self.db_path)
-        finally:
-            conn.close()
 
     # ── Vehicle CRUD ────────────────────────────────────────
     def add_vehicle(
@@ -85,8 +92,7 @@ class Database:
         access_level: str = "resident",
     ) -> None:
         """Insert or update a vehicle in the whitelist."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT INTO vehicles (plate_text, owner_name, access_level, active)
                    VALUES (?, ?, ?, 1)
@@ -98,57 +104,43 @@ class Database:
             )
             conn.commit()
             logger.info("Vehicle added/updated: %s", plate_text)
-        finally:
-            conn.close()
 
     def remove_vehicle(self, plate_text: str) -> None:
         """Soft-delete a vehicle (set active = 0)."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.execute(
                 "UPDATE vehicles SET active = 0 WHERE plate_text = ?",
                 (plate_text.upper().strip(),),
             )
             conn.commit()
             logger.info("Vehicle deactivated: %s", plate_text)
-        finally:
-            conn.close()
 
     def delete_vehicle(self, plate_text: str) -> None:
         """Hard-delete a vehicle from the whitelist."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.execute(
                 "DELETE FROM vehicles WHERE plate_text = ?",
                 (plate_text.upper().strip(),),
             )
             conn.commit()
             logger.info("Vehicle deleted: %s", plate_text)
-        finally:
-            conn.close()
 
     def is_whitelisted(self, plate_text: str) -> bool:
         """Return True if the plate is in the whitelist and active."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT 1 FROM vehicles WHERE plate_text = ? AND active = 1",
                 (plate_text.upper().strip(),),
             ).fetchone()
             return row is not None
-        finally:
-            conn.close()
 
     def get_all_vehicles(self) -> List[Dict[str, Any]]:
         """Return all active vehicles."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM vehicles WHERE active = 1 ORDER BY plate_text"
             ).fetchall()
             return [dict(r) for r in rows]
-        finally:
-            conn.close()
 
     # ── Event Logging ───────────────────────────────────────
     def log_event(
@@ -161,8 +153,7 @@ class Database:
         note: str = "",
     ) -> int:
         """Insert an event record. Returns the new row id."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.execute(
                 """INSERT INTO events
                    (plate_text, decision, ocr_confidence,
@@ -178,42 +169,33 @@ class Database:
                 row_id, plate_text, decision, ocr_confidence,
             )
             return row_id
-        finally:
-            conn.close()
 
-    def get_recent_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_recent_events(
+        self, limit: int = 50, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         """Return the most recent events, newest first."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM events ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
-        finally:
-            conn.close()
 
     def get_event_count(self) -> int:
         """Return total number of events."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute("SELECT COUNT(*) as cnt FROM events").fetchone()
             return row["cnt"]
-        finally:
-            conn.close()
 
     def get_today_event_count(self) -> int:
         """Return number of events logged today."""
         today = datetime.now().strftime("%Y-%m-%d")
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM events WHERE timestamp LIKE ?",
                 (f"{today}%",),
             ).fetchone()
             return row["cnt"]
-        finally:
-            conn.close()
 
     # ── Telegram Command Audit Log ───────────────────────────
     def log_telegram_command(
@@ -224,8 +206,7 @@ class Database:
         result: str = "",
     ) -> None:
         """Record a Telegram command in the audit log."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT INTO telegram_commands
                    (chat_id, command, args, result)
@@ -237,40 +218,29 @@ class Database:
                 "Telegram command logged: chat=%s cmd=%s args=%s",
                 chat_id, command, args,
             )
-        finally:
-            conn.close()
 
     def get_recent_telegram_commands(self, limit: int = 20) -> list:
         """Return most recent Telegram commands, newest first."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM telegram_commands ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
-        finally:
-            conn.close()
 
     # ── Settings ────────────────────────────────────────────
     def get_setting(self, key: str, default: str = "") -> str:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
             ).fetchone()
             return row["value"] if row else default
-        finally:
-            conn.close()
 
     def set_setting(self, key: str, value: str) -> None:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT INTO settings (key, value) VALUES (?, ?)
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                 (key, value),
             )
             conn.commit()
-        finally:
-            conn.close()

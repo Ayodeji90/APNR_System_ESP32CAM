@@ -1,87 +1,77 @@
 """
-ANPR System — HC-SR04 Ultrasonic Sensor Driver
+ANPR System — Ultrasonic Sensor Driver (ESP32-CAM Edition)
 
-Reads distance from the HC-SR04 sensor.  Falls back to a simulator
-when RPi.GPIO is not available (e.g. development on a laptop).
+Queries the ESP32-CAM edge device for HC-SR04 distance readings over HTTP.
+Falls back to a simulator when the ESP32 is unreachable.
 """
 
 import time
 import logging
 from typing import Optional
 
+import requests
+
 from src.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-# ── Try to import RPi.GPIO ──────────────────────────────────
-try:
-    import RPi.GPIO as GPIO
-    _HAS_GPIO = True
-except ImportError:
-    _HAS_GPIO = False
-    logger.warning("RPi.GPIO not available — sensor running in SIMULATOR mode.")
-
 
 class UltrasonicSensor:
-    """HC-SR04 distance sensor driver with graceful fallback."""
+    """HC-SR04 distance sensor — readings fetched from ESP32 over HTTP."""
 
     def __init__(self, cfg: AppConfig):
-        self.trigger_pin = cfg.sensor.trigger_pin
-        self.echo_pin = cfg.sensor.echo_pin
         self.threshold_cm = cfg.sensor.distance_threshold_cm
         self.confirmation_readings = cfg.sensor.confirmation_readings
         self.reading_interval = cfg.sensor.reading_interval_sec
-        self._simulator_distance: float = 100.0  # default far away
 
-        if _HAS_GPIO:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.trigger_pin, GPIO.OUT)
-            GPIO.setup(self.echo_pin, GPIO.IN)
-            GPIO.output(self.trigger_pin, False)
-            time.sleep(0.05)  # let sensor settle
-            logger.info(
-                "HC-SR04 initialised — TRIG=%d  ECHO=%d  threshold=%dcm",
-                self.trigger_pin, self.echo_pin, self.threshold_cm,
-            )
+        self._sensor_url = cfg.esp32.sensor_url
+        self._request_timeout = cfg.esp32.request_timeout_sec
+        self._auth_headers = cfg.esp32.auth_headers
+
+        self._simulator_distance: float = 100.0  # default far away
+        self._online: Optional[bool] = None  # None = not yet checked
+
+        logger.info(
+            "Ultrasonic sensor configured — ESP32 endpoint: %s  threshold=%dcm",
+            self._sensor_url, self.threshold_cm,
+        )
 
     # ── Core reading ────────────────────────────────────────
     def get_distance(self) -> float:
         """
-        Return distance in centimetres.
+        Return distance in centimetres from the ESP32 HC-SR04 sensor.
 
-        In simulator mode returns ``self._simulator_distance`` which can
-        be set programmatically for testing.
+        Falls back to simulator mode if the ESP32 is unreachable.
         """
-        if not _HAS_GPIO:
+        if not self._sensor_url:
+            logger.debug("No ESP32 sensor URL configured — using simulator.")
             return self._simulator_distance
 
-        # Send 10µs trigger pulse
-        GPIO.output(self.trigger_pin, True)
-        time.sleep(0.00001)
-        GPIO.output(self.trigger_pin, False)
-
-        # Wait for echo start (with timeout)
-        pulse_start = time.time()
-        timeout = pulse_start + 0.04  # 40ms max (~6.8m)
-        while GPIO.input(self.echo_pin) == 0:
-            pulse_start = time.time()
-            if pulse_start > timeout:
-                logger.debug("Echo start timeout")
-                return 999.0
-
-        # Wait for echo end
-        pulse_end = time.time()
-        timeout = pulse_end + 0.04
-        while GPIO.input(self.echo_pin) == 1:
-            pulse_end = time.time()
-            if pulse_end > timeout:
-                logger.debug("Echo end timeout")
-                return 999.0
-
-        # Calculate distance: speed of sound ≈ 34300 cm/s
-        distance = (pulse_end - pulse_start) * 34300 / 2
-        logger.debug("Distance reading: %.1f cm", distance)
-        return round(distance, 1)
+        try:
+            resp = requests.get(
+                self._sensor_url,
+                timeout=self._request_timeout,
+                headers=self._auth_headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            distance = float(data.get("distance_cm", 999.0))
+            logger.debug("Distance reading: %.1f cm", distance)
+            if self._online is not True:
+                self._online = True
+                logger.info("ESP32 sensor online — live readings active.")
+            return round(distance, 1)
+        except requests.RequestException as e:
+            if self._online is not False:
+                self._online = False
+                logger.warning(
+                    "ESP32 sensor unreachable at %s: %s — using simulator.",
+                    self._sensor_url, e,
+                )
+            return self._simulator_distance
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning("Bad response from ESP32 sensor: %s", e)
+            return self._simulator_distance
 
     # ── Presence detection ──────────────────────────────────
     def vehicle_present(self) -> bool:
@@ -109,6 +99,4 @@ class UltrasonicSensor:
 
     # ── Cleanup ─────────────────────────────────────────────
     def cleanup(self) -> None:
-        if _HAS_GPIO:
-            GPIO.cleanup([self.trigger_pin, self.echo_pin])
-            logger.info("Sensor GPIO cleaned up.")
+        logger.info("Sensor service stopped.")

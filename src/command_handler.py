@@ -3,7 +3,6 @@ ANPR System — Telegram Command Handler
 
 Starts a python-telegram-bot polling Application in a background
 daemon thread.  Receives inbound Telegram commands and maps them to
-daemon thread. Receives inbound Telegram commands and maps them to
 gate actions, whitelist management, and system queries.
 
 Security: every handler checks the sender's chat_id against the

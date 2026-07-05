@@ -1,8 +1,9 @@
 """
-ANPR System — Actuator Controller (Servo + Relay)
+ANPR System — Actuator Controller (ESP32-CAM Edition)
 
-Controls the barrier servo motor and/or relay module.
-Falls back to simulator mode when RPi.GPIO is not available.
+Sends HTTP commands to the ESP32-CAM edge device to control the
+barrier servo motor and/or relay module.
+Falls back to simulator mode when the ESP32 is unreachable.
 """
 
 import time
@@ -10,79 +11,59 @@ import logging
 import threading
 from typing import Optional
 
+import requests
+
 from src.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-# ── Try to import RPi.GPIO ──────────────────────────────────
-try:
-    import RPi.GPIO as GPIO
-    _HAS_GPIO = True
-except ImportError:
-    _HAS_GPIO = False
-    logger.warning("RPi.GPIO not available — actuator running in SIMULATOR mode.")
-
 
 class ActuatorController:
-    """Controls servo motor for barrier and relay for gate motor."""
+    """Controls servo motor for barrier and relay for gate motor via ESP32 HTTP API."""
 
     def __init__(self, cfg: AppConfig):
-        self.servo_pin = cfg.actuator.servo_pin
-        self.relay_pin = cfg.actuator.relay_pin
         self.open_angle = cfg.actuator.servo_open_angle
         self.closed_angle = cfg.actuator.servo_closed_angle
         self.open_duration = cfg.actuator.open_duration_sec
         self.use_servo = cfg.actuator.use_servo
         self.use_relay = cfg.actuator.use_relay
 
-        self._pwm: Optional[object] = None
+        self._open_url = cfg.esp32.barrier_open_url
+        self._close_url = cfg.esp32.barrier_close_url
+        self._request_timeout = cfg.esp32.request_timeout_sec
+        self._auth_headers = cfg.esp32.auth_headers
+
         self._close_timer: Optional[threading.Timer] = None
         self._barrier_open = False
+        self._online: Optional[bool] = None
 
-        if _HAS_GPIO:
-            GPIO.setmode(GPIO.BCM)
-            if self.use_servo:
-                GPIO.setup(self.servo_pin, GPIO.OUT)
-                self._pwm = GPIO.PWM(self.servo_pin, 50)  # 50Hz for servo
-                self._pwm.start(0)
-                self._set_servo_angle(self.closed_angle)
-                logger.info("Servo initialised on GPIO %d", self.servo_pin)
+        logger.info(
+            "Actuator configured — ESP32 endpoints: open=%s close=%s  servo=%s relay=%s",
+            self._open_url, self._close_url, self.use_servo, self.use_relay,
+        )
 
-            if self.use_relay:
-                GPIO.setup(self.relay_pin, GPIO.OUT)
-                GPIO.output(self.relay_pin, GPIO.LOW)
-                logger.info("Relay initialised on GPIO %d", self.relay_pin)
-        else:
-            logger.info(
-                "Actuator simulator: servo=%s relay=%s",
-                self.use_servo, self.use_relay,
+    # ── HTTP helpers ────────────────────────────────────────
+    def _post(self, url: str, label: str) -> bool:
+        """Send POST to ESP32 endpoint. Returns True on success."""
+        if not url:
+            logger.debug("[SIM] %s (no URL configured)", label)
+            return False
+        try:
+            resp = requests.post(
+                url, timeout=self._request_timeout, headers=self._auth_headers
             )
-
-    # ── Servo helpers ───────────────────────────────────────
-    def _angle_to_duty(self, angle: int) -> float:
-        """Convert angle (0–180) to duty cycle (2–12%)."""
-        return 2.0 + (angle / 180.0) * 10.0
-
-    def _set_servo_angle(self, angle: int) -> None:
-        """Move servo to a specific angle."""
-        if _HAS_GPIO and self._pwm:
-            duty = self._angle_to_duty(angle)
-            self._pwm.ChangeDutyCycle(duty)
-            time.sleep(0.5)  # allow servo to reach position
-            self._pwm.ChangeDutyCycle(0)  # stop jitter
-        else:
-            logger.debug("[SIM] Servo → %d°", angle)
-
-    # ── Relay helpers ───────────────────────────────────────
-    def _relay_on(self) -> None:
-        if _HAS_GPIO:
-            GPIO.output(self.relay_pin, GPIO.HIGH)
-        logger.debug("Relay ON")
-
-    def _relay_off(self) -> None:
-        if _HAS_GPIO:
-            GPIO.output(self.relay_pin, GPIO.LOW)
-        logger.debug("Relay OFF")
+            resp.raise_for_status()
+            if self._online is not True:
+                self._online = True
+                logger.info("ESP32 actuator online.")
+            logger.debug("%s → OK (%d)", label, resp.status_code)
+            return True
+        except requests.RequestException as e:
+            if self._online is not False:
+                self._online = False
+                logger.warning("ESP32 actuator unreachable at %s: %s", url, e)
+            logger.debug("[SIM] %s (ESP32 offline)", label)
+            return False
 
     # ── Public API ──────────────────────────────────────────
     def open_barrier(self) -> None:
@@ -92,10 +73,7 @@ class ActuatorController:
             self._cancel_close_timer()
         else:
             logger.info("Opening barrier …")
-            if self.use_servo:
-                self._set_servo_angle(self.open_angle)
-            if self.use_relay:
-                self._relay_on()
+            self._post(self._open_url, "barrier open")
             self._barrier_open = True
 
         # Schedule auto-close
@@ -112,10 +90,7 @@ class ActuatorController:
         """Close the barrier / deactivate the gate."""
         self._cancel_close_timer()
         logger.info("Closing barrier …")
-        if self.use_servo:
-            self._set_servo_angle(self.closed_angle)
-        if self.use_relay:
-            self._relay_off()
+        self._post(self._close_url, "barrier close")
         self._barrier_open = False
 
     @property
@@ -135,17 +110,7 @@ class ActuatorController:
     # ── Cleanup ─────────────────────────────────────────────
     def cleanup(self) -> None:
         self._cancel_close_timer()
-        if self.use_servo:
-            self._set_servo_angle(self.closed_angle)
-        if _HAS_GPIO:
-            if self._pwm:
-                self._pwm.stop()
-            pins = []
-            if self.use_servo:
-                pins.append(self.servo_pin)
-            if self.use_relay:
-                pins.append(self.relay_pin)
-            if pins:
-                GPIO.cleanup(pins)
+        if self._barrier_open:
+            self._post(self._close_url, "barrier close (cleanup)")
         self._barrier_open = False
-        logger.info("Actuator GPIO cleaned up.")
+        logger.info("Actuator service stopped.")

@@ -186,11 +186,20 @@ class TelegramNotifier:
     @staticmethod
     def _run(coro) -> None:
         """Run a coroutine from sync context without blocking the event loop."""
+        def _done_callback(task):
+            """Log exceptions from fire-and-forget tasks."""
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc:
+                logger.error("Telegram async task error: %s", exc)
+
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 # Already inside an event loop (e.g. command handler thread)
-                asyncio.ensure_future(coro)
+                task = asyncio.ensure_future(coro)
+                task.add_done_callback(_done_callback)
             else:
                 loop.run_until_complete(coro)
         except RuntimeError:

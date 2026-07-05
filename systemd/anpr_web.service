@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/ANPR_System
-ExecStart=/usr/bin/python3 -m web.app
+User=machinemustlearn
+WorkingDirectory=/home/machinemustlearn/WORKSPACE/ANPR_System
+ExecStart=/home/machinemustlearn/WORKSPACE/ANPR_System/venv/bin/python -m web.app
 Restart=always
 RestartSec=5
 StandardOutput=journal

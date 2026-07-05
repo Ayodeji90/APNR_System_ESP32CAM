@@ -207,15 +207,6 @@ class ANPRStateMachine:
                 self._decision.value if self._decision else "UNKNOWN",
             )
 
-        # Telegram notification (non-blocking, fire-and-forget)
-        if self.notifier:
-            self.notifier.notify_event(
-                plate=self._plate_text,
-                decision=self._decision.value if self._decision else "UNKNOWN",
-                ocr_conf=self._ocr_conf,
-                detection_conf=self._detection_conf,
-            )
-
         return State.LOG
 
     # ── LOG ─────────────────────────────────────────────────
@@ -235,6 +226,20 @@ class ANPRStateMachine:
             image_path=image_path,
             note=self._decision_reason,
         )
+
+        # Telegram notification (non-blocking, fire-and-forget)
+        # Sent here (after image save) so the image_path is available
+        if self.notifier:
+            abs_image_path = ""
+            if image_path:
+                abs_image_path = resolve_path(self.cfg, image_path)
+            self.notifier.notify_event(
+                plate=self._plate_text,
+                decision=self._decision.value if self._decision else "UNKNOWN",
+                ocr_conf=self._ocr_conf,
+                detection_conf=self._detection_conf,
+                image_path=abs_image_path,
+            )
 
         self._reset_cycle_data()
         logger.info("▶ Cycle complete — returning to IDLE\n")

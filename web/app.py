@@ -10,10 +10,12 @@ Provides a local web interface for:
 import os
 import sys
 import logging
+import secrets
+from functools import wraps
 
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, flash, jsonify, send_from_directory,
+    url_for, flash, jsonify, send_from_directory, Response,
 )
 
 # Add project root to path so we can import src.*
@@ -32,15 +34,44 @@ app = Flask(
     template_folder=os.path.join(os.path.dirname(__file__), "templates"),
     static_folder=os.path.join(os.path.dirname(__file__), "static"),
 )
-app.secret_key = "anpr-dashboard-secret-key-change-me"
-
 # Load config & DB (module-level so routes can use them)
 _cfg = load_config()
 _db = Database(_cfg)
 
+# Secret key: use config value, or auto-generate a random one
+app.secret_key = _cfg.web.secret_key or secrets.token_hex(32)
+
+
+# ── Basic Auth ─────────────────────────────────────────────
+def _check_auth(username: str, password: str) -> bool:
+    """Validate credentials against config."""
+    return (
+        username == _cfg.web.dashboard_username
+        and password == _cfg.web.dashboard_password
+    )
+
+
+def _auth_required(f):
+    """Decorator that enforces HTTP Basic Auth when credentials are configured."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Skip auth if no username/password configured
+        if not _cfg.web.dashboard_username or not _cfg.web.dashboard_password:
+            return f(*args, **kwargs)
+        auth = request.authorization
+        if not auth or not _check_auth(auth.username, auth.password):
+            return Response(
+                "Login required.",
+                401,
+                {"WWW-Authenticate": 'Basic realm="ANPR Dashboard"'},
+            )
+        return f(*args, **kwargs)
+    return decorated
+
 
 # ── Routes ──────────────────────────────────────────────────
 @app.route("/")
+@_auth_required
 def dashboard():
     """Main dashboard — system status + recent events."""
     recent = _db.get_recent_events(limit=10)
@@ -57,22 +88,23 @@ def dashboard():
 
 
 @app.route("/events")
+@_auth_required
 def events():
     """Paginated event log."""
-    page = request.args.get("page", 1, type=int)
+    page = max(request.args.get("page", 1, type=int), 1)
     per_page = 20
-    all_events = _db.get_recent_events(limit=per_page * page)
-    start = (page - 1) * per_page
-    page_events = all_events[start : start + per_page]
+    offset = (page - 1) * per_page
+    page_events = _db.get_recent_events(limit=per_page, offset=offset)
     return render_template(
         "events.html",
         events=page_events,
         page=page,
-        has_more=len(all_events) >= per_page * page,
+        has_more=len(page_events) >= per_page,
     )
 
 
 @app.route("/vehicles")
+@_auth_required
 def vehicles():
     """Vehicle whitelist management."""
     all_vehicles = _db.get_all_vehicles()
@@ -80,6 +112,7 @@ def vehicles():
 
 
 @app.route("/vehicles/add", methods=["POST"])
+@_auth_required
 def add_vehicle():
     """Add a plate to the whitelist."""
     plate = request.form.get("plate_text", "").strip().upper()
@@ -94,6 +127,7 @@ def add_vehicle():
 
 
 @app.route("/vehicles/remove", methods=["POST"])
+@_auth_required
 def remove_vehicle():
     """Remove a plate from the whitelist."""
     plate = request.form.get("plate_text", "").strip().upper()
@@ -105,6 +139,7 @@ def remove_vehicle():
 
 # ── API endpoints ───────────────────────────────────────────
 @app.route("/api/status")
+@_auth_required
 def api_status():
     """JSON system status."""
     return jsonify({
@@ -116,6 +151,7 @@ def api_status():
 
 
 @app.route("/api/events")
+@_auth_required
 def api_events():
     """JSON event list."""
     limit = request.args.get("limit", 50, type=int)
@@ -125,6 +161,7 @@ def api_events():
 
 # ── Serve event images ──────────────────────────────────────
 @app.route("/images/<path:filepath>")
+@_auth_required
 def serve_image(filepath):
     """Serve captured event images."""
     events_dir = resolve_path(_cfg, _cfg.paths.events_dir)
