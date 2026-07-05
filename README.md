@@ -1,5 +1,14 @@
 # 🚗 ANPR Gate System
 
+**Project Status** (as of 2026‑07‑05)
+
+- ✅ Config files updated for ESP32‑CAM
+- ✅ Camera, sensor, and actuator services rewritten to use HTTP
+- ✅ ESP32‑CAM Arduino sketch created and documented
+- ✅ Systemd service files updated to use the virtual‑environment Python interpreter
+- ✅ Application imports verified (`state_machine` and `main` load without errors)
+- 📌 Remaining tasks: run end‑to‑end integration test and enable the services
+
 **Automatic Number Plate Recognition** gate controller for **Raspberry Pi 3B+** with Pi Camera V2, HC-SR04 ultrasonic sensor, servo motor, and relay module.
 
 > Detect vehicle → capture image → detect plate → read characters → decide Allow/Deny → open barrier → log event.
@@ -81,351 +90,226 @@ Enable in OS:
 
 > ⚠ **Important:** The ribbon cable is fragile. Insert it fully (it clicks) and ensure the blue stripe faces the correct direction before closing the latch.
 
-#### Programmatic Implementation — `src/camera.py`
+## Hardware Requirements (ESP32‑CAM Edition)
 
-The `CameraService` class abstracts the hardware behind a single `capture_best_frame()` method.
-
-**Initialisation** — detects whether `picamera2` is available and configures resolution:
-
-```python
-from picamera2 import Picamera2
-
-class CameraService:
-    def __init__(self, cfg: AppConfig):
-        self._picam = Picamera2()
-        config = self._picam.create_still_configuration(
-            main={"size": (cfg.camera.resolution_width,
-                           cfg.camera.resolution_height)}
-        )
-        self._picam.configure(config)
-        self._picam.start()
-        time.sleep(cfg.camera.warmup_seconds)  # let sensor stabilise
-```
-
-**Frame capture with sharpness selection** — `picamera2` returns RGB arrays; they are converted to BGR for OpenCV:
-
-```python
-def capture_frame(self) -> np.ndarray:
-    frame = self._picam.capture_array()
-    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-def _laplacian_variance(frame: np.ndarray) -> float:
-    """Higher = sharper."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-def capture_best_frame(self) -> np.ndarray:
-    best, best_score = None, -1.0
-    for _ in range(self.capture_count):
-        frame = self.capture_frame()
-        score = self._laplacian_variance(frame)
-        if score > best_score:
-            best_score, best = score, frame
-        time.sleep(0.1)
-    return best
-```
-
-**Fallback (non-Pi machines):** When `picamera2` is not installed, the class transparently falls back to `cv2.VideoCapture(0)` (USB webcam or laptop camera), enabling full development and testing without Pi hardware.
+| Component | Model / Spec | Purpose |
+|---|---|---|
+| ESP32‑CAM (AI‑Thinker) | ESP32‑S2 MCU, OV2640 2 MP camera, 4 MiB PSRAM | Edge device handling camera, HC‑SR04, servo, relay; streams MJPEG over HTTP |
+| HC‑SR04 Ultrasonic Sensor | 2 cm – 400 cm range | Vehicle proximity detection (queried via ESP32 HTTP endpoint) |
+| SG90 / MG996R Servo | 0‑180° hobby servo | Physical barrier arm (controlled via ESP32 HTTP endpoint) |
+| Relay Module | 5 V single‑channel | External gate‑motor or solenoid control (via ESP32 HTTP endpoint) |
+| 5 V / 2 A Power Supply | ≥ 2 A rating | Powers ESP32‑CAM board and attached peripherals |
+| Voltage Divider | 1 kΩ + 2 kΩ resistors | Steps HC‑SR04 ECHO 5 V → 3.3 V for ESP32 GPIO |
 
 ---
 
-### 3. HC-SR04 Ultrasonic Sensor — Vehicle Presence Detection
+## Hardware Deep Dive (ESP32‑CAM Edition)
+
+This section explains **each hardware component** in full detail: its physical role in the gate system, how to wire it to the ESP32‑CAM board, and exactly how the Arduino sketch implements the low‑level control that feeds the rest of the software stack.
+
+---
+
+### 1. ESP32‑CAM (AI‑Thinker) — The Edge Processor
 
 #### Role
-Mounted at bumper height facing the approaching lane, the HC-SR04 acts as a **proximity tripwire**. It emits a 40 kHz ultrasonic pulse and times the echo to calculate distance. When a vehicle enters the detection zone (configurable threshold, default 50 cm), the state machine wakes up and begins the capture cycle.
+The ESP32‑CAM is the **edge brain**. It runs a lightweight Arduino sketch that:
+- Captures MJPEG video frames from the built‑in OV2640 camera and serves them over HTTP (`/stream` and `/capture`).
+- Reads the HC‑SR04 ultrasonic sensor and returns distance in centimetres (`/distance`).
+- Drives a hobby servo (barrier arm) and a relay (gate motor) via HTTP POST (`/barrier/open`, `/barrier/close`).
+- Exposes a `/status` endpoint with uptime, free heap, Wi‑Fi RSSI, and barrier state.
 
-#### How it works (physics)
-```
-TRIG pulse (10 µs HIGH) → module emits 8× 40 kHz bursts
-Echo pin goes HIGH → you time how long it stays HIGH
-Distance (cm) = (echo duration in seconds × 34300) / 2
-                          ↑ speed of sound in cm/s
+All heavy computation (OpenCV plate detection, Tesseract OCR, decision logic, database, web UI, Telegram) runs on a cloud/VPS render server that consumes the ESP32’s HTTP API.
+
+#### Key specs relevant to this project
+| Attribute | Value |
+|---|---|
+| MCU | Tensilica Xtensa 32‑bit, 240 MHz |
+| Wi‑Fi | 802.11b/g/n, 2.4 GHz |
+| Camera | OV2640, up to 2 MP (800×600 used) |
+| GPIO voltage | **3.3 V** (⚠ never connect a 5 V signal directly) |
+| PWM channels | 16 (hardware PWM via LEDC) |
+| Flash | 4 MiB (SPI flash) |
+| PSRAM | 4 MiB (optional, not used here) |
+
+---
+
+### 2. OV2640 Camera — Image Capture
+
+#### Role
+Mounted on the ESP32‑CAM board, the OV2640 captures **still JPEG frames**. The sketch streams a continuous MJPEG multipart response (`/stream`) and also provides a single‑shot JPEG endpoint (`/capture`).
+
+#### Wiring & Configuration
+The camera is soldered directly onto the ESP32‑CAM module – no external wiring required. In the sketch you can adjust:
+- `CAMERA_FRAME_SIZE` – e.g. `FRAMESIZE_SVGA` (800×600) for a good trade‑off between detail and bandwidth.
+- `CAMERA_JPEG_QUALITY` – lower values increase quality (0‑63 range).
+
+#### Sketch Implementation (excerpt)
+```cpp
+camera_config_t config;
+config.ledc_channel = LEDC_CHANNEL_0;
+config.ledc_timer   = LEDC_TIMER_0;
+config.pin_d0       = Y2_GPIO_NUM; // … pin mapping continues
+config.pixel_format = PIXFORMAT_JPEG;
+config.frame_size   = CAMERA_FRAME_SIZE;
+config.jpeg_quality = CAMERA_JPEG_QUALITY;
+config.fb_count     = 2;
+esp_err_t camErr = esp_camera_init(&config);
 ```
 
-#### Wiring
+The `/stream` handler builds a multipart response where each part contains a JPEG image. The Python `CameraService` reads this stream, extracts frames, and selects the sharpest one.
 
+---
+
+### 3. HC‑SR04 Ultrasonic Sensor — Vehicle Presence Detection
+
+#### Role
+Mounted at bumper height facing the approaching lane, the HC‑SR04 acts as a **proximity tripwire**. The ESP32‑CAM triggers the sensor and measures echo time to calculate distance. The result is exposed via a JSON endpoint (`/distance`).
+
+#### Wiring (to ESP32‑CAM GPIOs)
 ```
-HC-SR04 Pin  →  Pi GPIO                Notes
+HC‑SR04 Pin  →  ESP32‑CAM GPIO                Notes
 ───────────────────────────────────────────────────────────────
-VCC          →  5V (Pin 2 or 4)        Module runs on 5V
-GND          →  GND (Pin 6)
-TRIG         →  GPIO 23 (Pin 16)       3.3V output is enough to trigger
-ECHO         →  GPIO 24 (Pin 18)       ⚠ MUST use voltage divider!
+VCC          →  5 V (Vin)                     Power the sensor
+GND          →  GND                           Common ground
+TRIG         →  GPIO 12 (Pin 12)               3.3 V output is enough to trigger
+ECHO         →  GPIO 13 (Pin 13)               ⚠ MUST use voltage divider!
 ```
 
 **Voltage divider for ECHO pin (required):**
-
 ```
-ECHO pin (5V) ──┬── 1 kΩ ──── GPIO 24 (3.3V safe)
-                └── 2 kΩ ──── GND
+ECHO (5 V) ──┬── 1 kΩ ──── GPIO 13 (3.3 V safe)
+              └── 2 kΩ ──── GND
 ```
+The divider yields ≈ 3.33 V, safe for the ESP32’s 3.3 V GPIO.
 
-The 1 kΩ / 2 kΩ divider gives: V_out = 5V × 2/(1+2) = **3.33 V** ✓
+#### Sketch Implementation (excerpt)
+```cpp
+float readDistanceCm() {
+    // 10 µs trigger pulse
+    digitalWrite(PIN_HCSR04_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_HCSR04_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_HCSR04_TRIG, LOW);
 
-> ⚠ **Critical:** Connecting the raw 5V ECHO signal directly to a GPIO pin will damage the Pi's I/O bank.
-
-#### Programmatic Implementation — `src/sensor.py`
-
-```python
-import RPi.GPIO as GPIO, time
-
-class UltrasonicSensor:
-    def __init__(self, cfg):
-        self.trigger_pin = cfg.sensor.trigger_pin   # GPIO 23
-        self.echo_pin    = cfg.sensor.echo_pin       # GPIO 24
-        self.threshold_cm = cfg.sensor.distance_threshold_cm  # 50 cm
-
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.trigger_pin, GPIO.OUT)
-        GPIO.setup(self.echo_pin,    GPIO.IN)
-        GPIO.output(self.trigger_pin, False)
-        time.sleep(0.05)   # let sensor settle after power-on
-
-    def get_distance(self) -> float:
-        # 1. Send 10 µs trigger pulse
-        GPIO.output(self.trigger_pin, True)
-        time.sleep(0.00001)
-        GPIO.output(self.trigger_pin, False)
-
-        # 2. Wait for echo to go HIGH (with 40 ms timeout ≈ 6.8 m)
-        pulse_start = time.time()
-        while GPIO.input(self.echo_pin) == 0:
-            pulse_start = time.time()
-
-        # 3. Wait for echo to go LOW
-        pulse_end = time.time()
-        while GPIO.input(self.echo_pin) == 1:
-            pulse_end = time.time()
-
-        # 4. Calculate distance
-        return round((pulse_end - pulse_start) * 34300 / 2, 1)
-
-    def vehicle_present(self) -> bool:
-        """Require N consecutive close readings to avoid false triggers."""
-        consecutive = 0
-        for _ in range(self.confirmation_readings + 2):
-            if self.get_distance() < self.threshold_cm:
-                consecutive += 1
-                if consecutive >= self.confirmation_readings:
-                    return True
-            else:
-                consecutive = 0
-            time.sleep(self.reading_interval)
-        return False
+    // Wait for echo HIGH with timeout
+    unsigned long timeoutStart = micros();
+    while (digitalRead(PIN_HCSR04_ECHO) == LOW) {
+        if (micros() - timeoutStart > DISTANCE_TIMEOUT_US) return MAX_DISTANCE_CM;
+    }
+    unsigned long pulseStart = micros();
+    while (digitalRead(PIN_HCSR04_ECHO) == HIGH) {
+        if (micros() - pulseStart > DISTANCE_TIMEOUT_US) return MAX_DISTANCE_CM;
+    }
+    unsigned long pulseDuration = micros() - pulseStart;
+    float distance = pulseDuration * 0.0343f / 2.0f; // cm
+    return min(distance, MAX_DISTANCE_CM);
+}
 ```
-
-The **confirmation-readings debounce** (default: 3 consecutive readings) prevents false triggers from noise, birds, or brief reflections.
+The `/distance` handler simply calls `readDistanceCm()` and returns `{"distance_cm": <value>}`.
 
 ---
 
-### 4. SG90 / MG996R Servo Motor — Physical Barrier Arm
+### 4. Servo + Relay — Physical Barrier Actuation
 
 #### Role
-The servo is the **physical actuator** that raises and lowers the gate barrier arm. On an ALLOW decision, the servo sweeps from its closed angle (0°) to its open angle (90°), holds, and then automatically returns after a configurable timeout.
+The servo swings the barrier arm; the relay drives an external gate‑motor or solenoid for heavier barriers. Both are controlled via HTTP POST requests to the ESP32‑CAM.
 
-- **SG90** — lightweight, plastic gears, suits small model barriers.
-- **MG996R** — metal gears, higher torque, suits heavier real barriers.
-
-#### How it works (PWM)
-Servos are controlled by a **50 Hz PWM signal**. The duty cycle encodes the target angle:
-
+#### Wiring (to ESP32‑CAM GPIOs)
 ```
-Duty cycle formula: duty = 2.0 + (angle / 180.0) × 10.0
-
-Angle 0°   → duty ≈  2.0 %
-Angle 90°  → duty ≈  7.0 %
-Angle 180° → duty ≈ 12.0 %
+Component      →  ESP32‑CAM GPIO   Notes
+───────────────────────────────────────────────────────
+Servo signal    →  GPIO 14 (Pin 14)   PWM 50 Hz via LEDC channel 0
+Relay control  →  GPIO 15 (Pin 15)   HIGH = ON, LOW = OFF
+GND (all)      →  GND (Pin 1)        Common ground for ESP32, servo & relay power
+5 V rail       →  External 5 V supply (share GND) – powers servo & relay
 ```
+> ⚠ **Never** power the servo or relay directly from the ESP32’s 3.3 V rail. Use a dedicated 5 V supply and connect grounds.
 
-#### Wiring
+#### Sketch Implementation (excerpt)
+```cpp
+void setServoAngle(int angle) {
+    int pulseUs = map(constrain(angle,0,180), 0,180, 500,2400);
+    uint32_t duty = (uint32_t)pulseUs * 65536 / 20000; // LEDC 16‑bit duty
+    ledcWrite(0, duty);
+    delay(400);
+    ledcWrite(0, 0); // stop jitter
+}
 
-```
-Servo Wire   →  Connection                Notes
-─────────────────────────────────────────────────────────────
-Signal (orange/yellow) → GPIO 18 (Pin 12)   Hardware PWM pin
-VCC    (red)           → 5V EXTERNAL RAIL   NOT from Pi 5V
-GND    (brown/black)   → Common GND (shared with Pi)
-```
+void setRelay(bool on) {
+    digitalWrite(PIN_RELAY, on ? HIGH : LOW);
+}
 
-> ⚠ **Never power a servo from the Pi's 5V pin.** Servo stall current (SG90: ~360 mA, MG996R: ~900 mA) will drop the Pi voltage and cause crashes or corruption. Use a dedicated 5V supply.
-
-#### Programmatic Implementation — `src/actuator.py`
-
-```python
-import RPi.GPIO as GPIO, time, threading
-
-class ActuatorController:
-    def __init__(self, cfg):
-        self.servo_pin   = cfg.actuator.servo_pin        # GPIO 18
-        self.open_angle  = cfg.actuator.servo_open_angle  # 90°
-        self.closed_angle = cfg.actuator.servo_closed_angle # 0°
-
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.servo_pin, GPIO.OUT)
-        self._pwm = GPIO.PWM(self.servo_pin, 50)   # 50 Hz
-        self._pwm.start(0)
-        self._set_servo_angle(self.closed_angle)   # start closed
-
-    def _angle_to_duty(self, angle: int) -> float:
-        return 2.0 + (angle / 180.0) * 10.0
-
-    def _set_servo_angle(self, angle: int) -> None:
-        duty = self._angle_to_duty(angle)
-        self._pwm.ChangeDutyCycle(duty)
-        time.sleep(0.5)          # wait for servo to reach position
-        self._pwm.ChangeDutyCycle(0)  # stop signal to prevent jitter
-
-    def open_barrier(self) -> None:
-        self._set_servo_angle(self.open_angle)
-        # Schedule auto-close after open_duration seconds
-        timer = threading.Timer(self.open_duration, self.close_barrier)
-        timer.daemon = True
-        timer.start()
-
-    def close_barrier(self) -> None:
-        self._set_servo_angle(self.closed_angle)
+// POST /barrier/open → open angle + relay ON
+// POST /barrier/close → closed angle + relay OFF
 ```
 
-The **auto-close timer** runs in a daemon thread. If `open_barrier()` is called again before the timer fires, the timer is cancelled and reset, preventing mid-sweep interruptions.
+The Python `ActuatorController` simply POSTs to these endpoints; the sketch moves the servo and toggles the relay accordingly.
 
 ---
 
-### 5. Relay Module — External Gate Motor / Solenoid Control
+## Migration to ESP32‑CAM (New Architecture)
 
-#### Role
-The relay is an **electrically isolated switch** that allows the 3.3V/5V Pi GPIO to control high-voltage/high-current loads — e.g., a 12V gate motor, a 24V electromagnetic solenoid lock, or a commercial gate controller. It is **optional** — the servo alone is sufficient for a model barrier.
+**TL;DR** – The Raspberry Pi is completely removed. All hardware I/O (camera, HC‑SR04, servo, relay) is now handled by an ESP32‑CAM board that streams MJPEG over HTTP to a cloud/VPS render server. The Python stack (vision, decision, DB, web UI, Telegram) runs **exclusively** on the server.
 
-#### How it works
-A relay module contains an electromechanical or solid-state relay. A small GPIO output signal (3.3V–5V) energises the relay coil, which mechanically closes the high-current contacts, powering the external device. Most commonly used modules are **active-LOW** (energises when GPIO is LOW).
+### Why ESP32‑CAM?
+- **Built‑in Wi‑Fi** – no extra networking hardware.
+- **Integrated OV2640 camera** – MJPEG streaming support.
+- **Sufficient GPIO** for HC‑SR04, a hobby‑servo and a relay.
+- **Low power & cost** – ~US$10 board vs. a full Pi.
+- **Simplifies deployment** – only a single edge device at the gate; all heavy compute stays in the cloud.
 
-#### Wiring
-
+### New System Diagram
 ```
-Relay Pin  →  Connection          Notes
-─────────────────────────────────────────────────────────────
-IN         →  GPIO 25 (Pin 22)    Control signal (LOW = ON for active-LOW modules)
-VCC        →  5V (Pi or external)
-GND        →  Common GND
-COM        →  External supply +
-NO         →  Gate motor / solenoid +  (NO = Normally Open)
-GND/−      →  Gate motor / solenoid −
-```
-
-> ⚠ **Safety:** Always use a flyback (snubber) diode across inductive loads (motors, solenoids) to suppress voltage spikes when the relay opens.
-
-#### Programmatic Implementation — `src/actuator.py` (relay section)
-
-```python
-# Inside ActuatorController.__init__()
-GPIO.setup(self.relay_pin, GPIO.OUT)
-GPIO.output(self.relay_pin, GPIO.LOW)   # ensure off at startup
-
-# Open gate (energise relay)
-def _relay_on(self):
-    GPIO.output(self.relay_pin, GPIO.HIGH)
-
-# Close gate (de-energise relay)
-def _relay_off(self):
-    GPIO.output(self.relay_pin, GPIO.LOW)
+[ ESP32‑CAM ]  <--Wi‑Fi-->  [ Cloud/VPS Render Server ]
+   |  (MJPEG stream, /distance, /barrier/*)   |
+   |                                          |
+   |  Python services (camera, sensor, actuator)  |
+   |  ──> OpenCV, Tesseract, SQLite, Flask, Telegram
+   └───────────────────────────────────────────────
 ```
 
-The `ActuatorController` can operate the servo only, the relay only, or both simultaneously depending on the `use_servo` / `use_relay` flags in `config.yaml`. This means you can upgrade the gate hardware without changing any application logic.
-
----
-
-### 6. Software-Defined Components (No Physical Wiring)
-
-These components run entirely in software on the Pi's CPU and process the image data coming from the camera.
-
-#### 6a. Plate Detector — `src/plate_detector.py`
-Uses OpenCV to find rectangular contours in the camera frame that match the aspect ratio of a licence plate (configurable min/max). The best candidate is extracted via a **perspective transform** (`cv2.getPerspectiveTransform`) to correct for camera angle, then cropped and forwarded to the OCR engine.
-
-```python
-# Edge detection → contour → filter by 4-vertex polygon + aspect ratio
-edges = preprocessor.preprocess_for_detection(frame)
-contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-for c in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
-    approx = cv2.approxPolyDP(c, 0.018 * cv2.arcLength(c, True), True)
-    if len(approx) == 4:                   # rectangle
-        x, y, w, h = cv2.boundingRect(approx)
-        if aspect_min <= w/h <= aspect_max:
-            plate_crop = four_point_transform(frame, approx)
-```
-
-#### 6b. OCR Engine — `src/ocr_engine.py`
-Uses **Tesseract** (via `pytesseract`) with a character whitelist (`A-Z0-9`) and Page Segmentation Mode 8 (single word) to read the licence plate text. Confidence is extracted per-word from `image_to_data()`. If first-pass confidence is low, an enhanced preprocessing pipeline (adaptive threshold, morphological ops) is tried automatically.
-
-```python
-config = f"--psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-data = pytesseract.image_to_data(image, config=config,
-                                 output_type=pytesseract.Output.DICT)
-# Normalize: uppercase, strip non-alphanumeric
-plate_text = re.sub(r"[^A-Z0-9]", "", raw_text.upper().strip())
-```
-
----
-
-## System Abstraction Layers
-
-The following diagram shows how **each hardware component maps to a software abstraction layer**, and how those layers compose upward through the state machine to the final gate decision.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     APPLICATION LAYER                           │
-│  src/main.py  ──  Web Dashboard (Flask)  ──  SQLite Database    │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ drives
-┌───────────────────────────▼─────────────────────────────────────┐
-│                    ORCHESTRATION LAYER                          │
-│          src/state_machine.py  (ANPRStateMachine)               │
-│  IDLE → TRIGGERED → CAPTURE → DETECT → OCR → DECIDE → ACTUATE  │
-└──────┬────────────┬────────────┬──────────────┬─────────────────┘
-       │            │            │              │
-       │ polls      │ triggers   │ sends crop   │ commands
-       ▼            ▼            ▼              ▼
-┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  ┌────────────┐
-│ SENSOR   │  │  CAMERA  │  │    VISION PIPELINE        │  │ ACTUATOR   │
-│  LAYER   │  │  LAYER   │  │         LAYER             │  │  LAYER     │
-│          │  │          │  │                           │  │            │
-│sensor.py │  │camera.py │  │ plate_detector.py         │  │actuator.py │
-│          │  │          │  │ preprocessing.py           │  │            │
-│ get_     │  │ capture_ │  │ ocr_engine.py             │  │ open/close │
-│ distance │  │ best_    │  │ decision_engine.py        │  │ _barrier() │
-│ vehicle_ │  │ frame()  │  │                           │  │            │
-│ present()│  │          │  │                           │  │            │
-└────┬─────┘  └────┬─────┘  └───────────┬───────────────┘  └─────┬──────┘
-     │              │                    │                         │
-     │ RPi.GPIO     │ picamera2 / OpenCV │ OpenCV + pytesseract    │ RPi.GPIO
-     ▼              ▼                    ▼                         ▼
-┌──────────┐  ┌──────────┐         ┌──────────┐         ┌─────────────────┐
-│ HC-SR04  │  │Pi Camera │         │  Pi CPU  │         │  Servo (GPIO18) │
-│Ultrasonic│  │  V2 CSI  │         │(Software)│         │  Relay (GPIO25) │
-│ Sensor   │  │          │         │          │         │                 │
-│TRIG:GP23 │  │ 15-pin   │         │          │         │  Barrier Arm /  │
-│ECHO:GP24 │  │ ribbon   │         │          │         │  Gate Motor     │
-└──────────┘  └──────────┘         └──────────┘         └─────────────────┘
-                               PHYSICAL HARDWARE
-```
-
-### Layer Responsibilities
-
-| Layer | Files | What it does |
+### What changed in the codebase?
+| Component | Old (Pi) | New (ESP32‑CAM) |
 |---|---|---|
-| **Physical** | GPIO pins, CSI ribbon | Raw electrical signals & photons |
-| **Sensor** | `sensor.py` | Converts echo timing into cm; debounces readings |
-| **Camera** | `camera.py` | Configures Pi Camera; selects sharpest frame |
-| **Vision** | `plate_detector.py`, `preprocessing.py`, `ocr_engine.py` | Finds plate region → reads text → scores confidence |
-| **Orchestration** | `state_machine.py` | Drives the full IDLE→LOG cycle; handles retries and fail-safe |
-| **Application** | `main.py`, `web/app.py`, `database.py` | Entry point, web dashboard, event persistence |
+| Camera | `picamera2` → local CSI | MJPEG HTTP stream (`src/camera.py` rewritten) |
+| Sensor | Direct GPIO trigger/echo | HTTP GET `/distance` (`src/sensor.py` rewritten) |
+| Actuator | PWM + GPIO relay | HTTP POST `/barrier/open` & `/barrier/close` (`src/actuator.py` rewritten) |
+| Config | `config.yaml` Pi‑specific fields | New `esp32:` section with URLs & timeouts |
+| Requirements | No `requests` | Added `requests` |
+| Firmware | None | New Arduino sketch `esp32cam/esp32cam.ino` |
 
-### How Hardware Talks to the Raspberry Pi
 
-```
-Raspberry Pi 3B+
-│
-├── GPIO Bank (3.3V logic, RPi.GPIO library)
-│   ├── GPIO 23  OUT  → HC-SR04 TRIG    (10µs pulse to trigger sonar)
-│   ├── GPIO 24  IN   ← HC-SR04 ECHO    (pulse width = distance ÷ sounds speed)
+## Getting Started (ESP32‑CAM Edition)
+
+1. **Flash the ESP32‑CAM firmware** – see `esp32cam/esp32cam.ino`.
+2. **Configure Wi‑Fi** in the sketch (SSID / password).
+3. **Update `config.yaml`** – set `esp32.base_url` to the ESP32’s IP (or mDNS name) and adjust paths if you changed them.
+4. **Deploy the Python stack** on a cloud/VPS (Ubuntu 22.04+ recommended). Install dependencies:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+5. **Run the service**:
+   ```bash
+   python -m src.main
+   ```
+   The system will now pull frames from the ESP32, run the vision pipeline, and control the barrier via HTTP.
+
+---
+
+## Development & Testing (No ESP32 hardware?)
+
+- **Simulator mode** – All hardware classes (`CameraService`, `UltrasonicSensor`, `ActuatorController`) fall back to a *simulated* implementation when the ESP32 endpoint is unreachable. You can manually set distances or barrier state via the class methods (`set_simulator_distance`, etc.) for unit‑tests.
+- **Unit tests** – The `tests/` directory already contains mocks for the hardware services; they continue to work unchanged.
+
+---
+
+## License
+
+MIT – see `LICENSE` file.
+
 │   │                   [via 1kΩ/2kΩ voltage divider — 5V to 3.3V]
 │   ├── GPIO 18  OUT  → Servo Signal     (50 Hz PWM, duty cycle = angle)
 │   └── GPIO 25  OUT  → Relay IN        (HIGH/LOW to open/close gate)
@@ -660,4 +544,4 @@ All settings live in `config.yaml`:
 ## License
 
 MIT
- 
+ # APNR_System_ESP32CAM
