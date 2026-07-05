@@ -17,7 +17,7 @@ class TestLoadConfig:
         assert isinstance(cfg, AppConfig)
         assert cfg.camera.resolution_width == 640
         assert cfg.sensor.distance_threshold_cm == 50
-        assert cfg.actuator.servo_pin == 18
+        assert cfg.actuator.servo_open_angle == 90
         assert cfg.detection.max_retries == 3
         assert cfg.ocr.engine == "tesseract"
 

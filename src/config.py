@@ -15,16 +15,8 @@ import yaml
 # ── Defaults ────────────────────────────────────────────────
 _DEFAULTS = {
     "esp32": {
-        "base_url": "",
         "api_key": "",
-        "stream_path": "/stream",
-        "capture_path": "/capture",
-        "sensor_path": "/distance",
-        "barrier_open_path": "/barrier/open",
-        "barrier_close_path": "/barrier/close",
-        "status_path": "/status",
-        "stream_timeout_sec": 10,
-        "request_timeout_sec": 5,
+        "heartbeat_timeout_sec": 120,
     },
     "camera": {
         "resolution_width": 640,
@@ -90,60 +82,34 @@ _DEFAULTS = {
 # ── Nested Config Dataclasses ───────────────────────────────
 @dataclass
 class Esp32Config:
-    """ESP32-CAM edge device connection settings."""
-    base_url: str = ""
+    """ESP32-CAM push-model settings.
+
+    The ESP32 pushes images and heartbeats to the server.
+    The api_key is used to authenticate incoming requests from the ESP32.
+    """
     api_key: str = ""
-    stream_path: str = "/stream"
-    capture_path: str = "/capture"
-    sensor_path: str = "/distance"
-    barrier_open_path: str = "/barrier/open"
-    barrier_close_path: str = "/barrier/close"
-    status_path: str = "/status"
-    stream_timeout_sec: int = 10
-    request_timeout_sec: int = 5
+    heartbeat_timeout_sec: int = 120
 
-    @property
-    def auth_headers(self) -> dict:
-        """HTTP headers for authenticating against the ESP32 (empty if no key set)."""
-        return {"X-Api-Key": self.api_key} if self.api_key else {}
-
-    @property
-    def stream_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.stream_path}"
-
-    @property
-    def capture_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.capture_path}"
-
-    @property
-    def sensor_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.sensor_path}"
-
-    @property
-    def barrier_open_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.barrier_open_path}"
-
-    @property
-    def barrier_close_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.barrier_close_path}"
-
-    @property
-    def status_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.status_path}"
+    def api_key_valid(self, key: str) -> bool:
+        """Return True if the provided key matches the configured API key.
+        If no key is configured, all requests are accepted (unsafe!)."""
+        if not self.api_key:
+            return True
+        return key == self.api_key
 
 
 @dataclass
 class CameraConfig:
-    """Camera capture settings (frames pulled from ESP32 MJPEG stream)."""
+    """Camera capture settings."""
     resolution_width: int = 640
     resolution_height: int = 480
     capture_count: int = 5
-    warmup_seconds: int = 0  # Not needed for MJPEG stream
+    warmup_seconds: int = 0
 
 
 @dataclass
 class SensorConfig:
-    """Ultrasonic sensor settings (readings fetched from ESP32 over HTTP)."""
+    """Ultrasonic sensor settings (thresholds used by ESP32 firmware)."""
     distance_threshold_cm: int = 50
     confirmation_readings: int = 3
     reading_interval_sec: float = 0.1
@@ -151,7 +117,7 @@ class SensorConfig:
 
 @dataclass
 class ActuatorConfig:
-    """Barrier actuator settings (commands sent to ESP32 over HTTP)."""
+    """Barrier actuator settings."""
     servo_open_angle: int = 90
     servo_closed_angle: int = 0
     open_duration_sec: int = 10
@@ -266,17 +232,24 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
     merged = _deep_merge(_DEFAULTS, raw)
 
+    # Filter each section to only include fields the dataclass accepts,
+    # so old pull-model keys in config.yaml don't cause errors.
+    def _filter(dc_class, data: dict) -> dict:
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(dc_class)}
+        return {k: v for k, v in data.items() if k in valid_fields}
+
     cfg = AppConfig(
-        esp32=Esp32Config(**merged["esp32"]),
-        camera=CameraConfig(**merged["camera"]),
-        sensor=SensorConfig(**merged["sensor"]),
-        actuator=ActuatorConfig(**merged["actuator"]),
-        detection=DetectionConfig(**merged["detection"]),
-        ocr=OcrConfig(**merged["ocr"]),
-        paths=PathsConfig(**merged["paths"]),
-        web=WebConfig(**merged["web"]),
-        logging=LoggingConfig(**merged["logging"]),
-        telegram=TelegramConfig(**merged["telegram"]),
+        esp32=Esp32Config(**_filter(Esp32Config, merged["esp32"])),
+        camera=CameraConfig(**_filter(CameraConfig, merged["camera"])),
+        sensor=SensorConfig(**_filter(SensorConfig, merged["sensor"])),
+        actuator=ActuatorConfig(**_filter(ActuatorConfig, merged["actuator"])),
+        detection=DetectionConfig(**_filter(DetectionConfig, merged["detection"])),
+        ocr=OcrConfig(**_filter(OcrConfig, merged["ocr"])),
+        paths=PathsConfig(**_filter(PathsConfig, merged["paths"])),
+        web=WebConfig(**_filter(WebConfig, merged["web"])),
+        logging=LoggingConfig(**_filter(LoggingConfig, merged["logging"])),
+        telegram=TelegramConfig(**_filter(TelegramConfig, merged["telegram"])),
         base_dir=base_dir,
     )
 

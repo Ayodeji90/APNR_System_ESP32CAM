@@ -157,36 +157,51 @@ class TelegramCommandHandler:
         self._log_command(update.effective_chat.id, "last_event", "", "ok")
 
     async def _cmd_snapshot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📸 Capturing image …")
+        """Return the most recent captured frame or event image."""
         try:
             import cv2, tempfile, os
-            frame = self._camera.capture_frame()
-            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            cv2.imwrite(tmp.name, frame)
-            with open(tmp.name, "rb") as photo:
-                await update.message.reply_photo(photo=photo, caption="📸 Live snapshot")
-            os.unlink(tmp.name)
-            self._log_command(update.effective_chat.id, "snapshot", "", "ok")
+            frame = self._camera.capture_frame() if self._camera else None
+
+            # If camera has a recent frame, send it
+            if frame is not None and frame.any():
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                cv2.imwrite(tmp.name, frame)
+                age = self._camera.frame_age_seconds if self._camera else 0
+                caption = f"📸 Last captured frame ({age:.0f}s ago)"
+                with open(tmp.name, "rb") as photo:
+                    await update.message.reply_photo(photo=photo, caption=caption)
+                os.unlink(tmp.name)
+                self._log_command(update.effective_chat.id, "snapshot", "", "ok")
+            else:
+                await update.message.reply_text(
+                    "📭 No images available yet — waiting for ESP32 to detect a vehicle."
+                )
         except Exception as exc:
             logger.error("Snapshot command failed: %s", exc)
             await update.message.reply_text(f"❌ Snapshot failed: {exc}")
 
     async def _cmd_open_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            self._actuator.open_barrier()
-            await update.message.reply_text("✅ Gate opened remotely.")
-            self._log_command(update.effective_chat.id, "open_gate", "", "opened")
-            logger.info("Gate opened via Telegram by chat_id=%s", update.effective_chat.id)
+            self._db.queue_command("open", source="telegram")
+            await update.message.reply_text(
+                "✅ Gate OPEN command queued.\n"
+                "⏳ The ESP32 will execute it on its next heartbeat (~30s)."
+            )
+            self._log_command(update.effective_chat.id, "open_gate", "", "queued")
+            logger.info("Gate open queued via Telegram by chat_id=%s", update.effective_chat.id)
         except Exception as exc:
-            await update.message.reply_text(f"❌ Failed to open gate: {exc}")
+            await update.message.reply_text(f"❌ Failed to queue open command: {exc}")
 
     async def _cmd_close_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            self._actuator.close_barrier()
-            await update.message.reply_text("✅ Gate closed.")
-            self._log_command(update.effective_chat.id, "close_gate", "", "closed")
+            self._db.queue_command("close", source="telegram")
+            await update.message.reply_text(
+                "✅ Gate CLOSE command queued.\n"
+                "⏳ The ESP32 will execute it on its next heartbeat (~30s)."
+            )
+            self._log_command(update.effective_chat.id, "close_gate", "", "queued")
         except Exception as exc:
-            await update.message.reply_text(f"❌ Failed to close gate: {exc}")
+            await update.message.reply_text(f"❌ Failed to queue close command: {exc}")
 
     async def _cmd_add_plate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         args = context.args

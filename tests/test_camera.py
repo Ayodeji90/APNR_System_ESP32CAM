@@ -1,4 +1,4 @@
-"""Tests for src.camera — Camera capture service (simulator/fallback mode)."""
+"""Tests for src.camera — Camera frame holder (push-model)."""
 
 import pytest
 import numpy as np
@@ -13,8 +13,6 @@ def cfg():
         camera=CameraConfig(
             resolution_width=320,
             resolution_height=240,
-            capture_count=3,
-            warmup_seconds=0,
         ),
     )
 
@@ -25,40 +23,35 @@ def camera(cfg):
 
 
 class TestCaptureFrame:
-    def test_returns_numpy_array(self, camera):
+    def test_returns_blank_when_empty(self, camera):
         frame = camera.capture_frame()
         assert isinstance(frame, np.ndarray)
+        assert frame.shape == (240, 320, 3)
+        assert np.sum(frame) == 0
 
-    def test_frame_has_correct_shape(self, camera):
+    def test_update_and_capture(self, camera):
+        test_frame = np.ones((240, 320, 3), dtype=np.uint8) * 128
+        camera.update_frame(test_frame)
+        
         frame = camera.capture_frame()
-        assert len(frame.shape) == 3  # H, W, C
-        assert frame.shape[2] == 3   # BGR channels
-
-    def test_frame_is_uint8(self, camera):
-        frame = camera.capture_frame()
-        assert frame.dtype == np.uint8
-
-
-class TestCaptureBestFrame:
-    def test_returns_numpy_array(self, camera):
-        frame = camera.capture_best_frame()
         assert isinstance(frame, np.ndarray)
+        assert frame.shape == (240, 320, 3)
+        assert frame[0, 0, 0] == 128
 
-    def test_best_frame_has_correct_channels(self, camera):
-        frame = camera.capture_best_frame()
-        assert frame.shape[2] == 3
+    def test_has_frame_property(self, camera):
+        assert camera.has_frame is False
+        camera.update_frame(np.zeros((240, 320, 3), dtype=np.uint8))
+        assert camera.has_frame is True
 
 
-class TestLaplacianVariance:
-    def test_blank_image_low_sharpness(self):
-        blank = np.zeros((100, 100, 3), dtype=np.uint8)
-        score = CameraService._laplacian_variance(blank)
-        assert score == 0.0
-
-    def test_noisy_image_higher_sharpness(self):
-        noisy = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        score = CameraService._laplacian_variance(noisy)
-        assert score > 0.0
+class TestFrameAge:
+    def test_frame_age_infinity_when_empty(self, camera):
+        assert camera.frame_age_seconds == float("inf")
+        
+    def test_frame_age_updates(self, camera):
+        camera.update_frame(np.zeros((240, 320, 3), dtype=np.uint8))
+        assert camera.frame_age_seconds >= 0.0
+        assert camera.frame_age_seconds < 1.0
 
 
 class TestCleanup:

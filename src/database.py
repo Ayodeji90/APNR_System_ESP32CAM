@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS telegram_commands (
     args      TEXT DEFAULT '',
     result    TEXT DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS pending_commands (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    command   TEXT NOT NULL,
+    source    TEXT DEFAULT 'telegram',
+    acknowledged INTEGER DEFAULT 0
+);
 """
 
 
@@ -244,3 +252,40 @@ class Database:
                 (key, value),
             )
             conn.commit()
+
+    # ── Pending Commands (ESP32 push-model) ──────────────────
+    def queue_command(self, command: str, source: str = "telegram") -> int:
+        """Queue a command for the ESP32 to pick up on its next heartbeat.
+        Returns the new row id."""
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO pending_commands (command, source) VALUES (?, ?)",
+                (command, source),
+            )
+            conn.commit()
+            logger.info("Pending command queued: %s (source=%s)", command, source)
+            return cur.lastrowid
+
+    def get_pending_commands(self) -> list:
+        """Return all unacknowledged pending commands, oldest first."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_commands WHERE acknowledged = 0 ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def acknowledge_command(self, command_id: int) -> None:
+        """Mark a pending command as acknowledged by the ESP32."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE pending_commands SET acknowledged = 1 WHERE id = ?",
+                (command_id,),
+            )
+            conn.commit()
+
+    def acknowledge_all_commands(self) -> None:
+        """Mark all pending commands as acknowledged."""
+        with self._connection() as conn:
+            conn.execute("UPDATE pending_commands SET acknowledged = 1")
+            conn.commit()
+

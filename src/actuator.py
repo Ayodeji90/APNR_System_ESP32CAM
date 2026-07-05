@@ -1,17 +1,13 @@
 """
-ANPR System — Actuator Controller (ESP32-CAM Edition)
+ANPR System — Actuator Controller (Push-Model)
 
-Sends HTTP commands to the ESP32-CAM edge device to control the
-barrier servo motor and/or relay module.
-Falls back to simulator mode when the ESP32 is unreachable.
+In the push-based architecture, barrier commands are sent to the ESP32
+via pending commands in the database.  The ESP32 picks them up during
+its periodic heartbeat.  This module provides the interface that
+Telegram commands and the web dashboard use.
 """
 
-import time
 import logging
-import threading
-from typing import Optional
-
-import requests
 
 from src.config import AppConfig
 
@@ -19,98 +15,41 @@ logger = logging.getLogger(__name__)
 
 
 class ActuatorController:
-    """Controls servo motor for barrier and relay for gate motor via ESP32 HTTP API."""
+    """Queues barrier commands for the ESP32 to pick up via heartbeat."""
 
-    def __init__(self, cfg: AppConfig):
-        self.open_angle = cfg.actuator.servo_open_angle
-        self.closed_angle = cfg.actuator.servo_closed_angle
+    def __init__(self, cfg: AppConfig, db=None):
         self.open_duration = cfg.actuator.open_duration_sec
-        self.use_servo = cfg.actuator.use_servo
-        self.use_relay = cfg.actuator.use_relay
-
-        self._open_url = cfg.esp32.barrier_open_url
-        self._close_url = cfg.esp32.barrier_close_url
-        self._request_timeout = cfg.esp32.request_timeout_sec
-        self._auth_headers = cfg.esp32.auth_headers
-
-        self._close_timer: Optional[threading.Timer] = None
+        self._db = db
         self._barrier_open = False
-        self._online: Optional[bool] = None
 
         logger.info(
-            "Actuator configured — ESP32 endpoints: open=%s close=%s  servo=%s relay=%s",
-            self._open_url, self._close_url, self.use_servo, self.use_relay,
+            "Actuator controller initialised (commands queued for ESP32 heartbeat)"
         )
 
-    # ── HTTP helpers ────────────────────────────────────────
-    def _post(self, url: str, label: str) -> bool:
-        """Send POST to ESP32 endpoint. Returns True on success."""
-        if not url:
-            logger.debug("[SIM] %s (no URL configured)", label)
-            return False
-        try:
-            resp = requests.post(
-                url, timeout=self._request_timeout, headers=self._auth_headers
-            )
-            resp.raise_for_status()
-            if self._online is not True:
-                self._online = True
-                logger.info("ESP32 actuator online.")
-            logger.debug("%s → OK (%d)", label, resp.status_code)
-            return True
-        except requests.RequestException as e:
-            if self._online is not False:
-                self._online = False
-                logger.warning("ESP32 actuator unreachable at %s: %s", url, e)
-            logger.debug("[SIM] %s (ESP32 offline)", label)
-            return False
+    def set_db(self, db) -> None:
+        """Set the database reference (for deferred initialisation)."""
+        self._db = db
 
-    # ── Public API ──────────────────────────────────────────
     def open_barrier(self) -> None:
-        """Open the barrier / activate the gate."""
-        if self._barrier_open:
-            logger.debug("Barrier already open — resetting close timer.")
-            self._cancel_close_timer()
-        else:
-            logger.info("Opening barrier …")
-            self._post(self._open_url, "barrier open")
-            self._barrier_open = True
-
-        # Schedule auto-close
-        self._close_timer = threading.Timer(
-            self.open_duration, self._auto_close
-        )
-        self._close_timer.daemon = True
-        self._close_timer.start()
-        logger.info(
-            "Barrier open — auto-close in %ds", self.open_duration
-        )
+        """Queue an 'open' command for the ESP32."""
+        logger.info("Queuing barrier OPEN command …")
+        if self._db:
+            self._db.queue_command("open", source="server")
+        self._barrier_open = True
 
     def close_barrier(self) -> None:
-        """Close the barrier / deactivate the gate."""
-        self._cancel_close_timer()
-        logger.info("Closing barrier …")
-        self._post(self._close_url, "barrier close")
+        """Queue a 'close' command for the ESP32."""
+        logger.info("Queuing barrier CLOSE command …")
+        if self._db:
+            self._db.queue_command("close", source="server")
         self._barrier_open = False
 
     @property
     def is_open(self) -> bool:
         return self._barrier_open
 
-    # ── Internal ────────────────────────────────────────────
-    def _auto_close(self) -> None:
-        logger.info("Auto-close timer fired.")
-        self.close_barrier()
-
-    def _cancel_close_timer(self) -> None:
-        if self._close_timer and self._close_timer.is_alive():
-            self._close_timer.cancel()
-            self._close_timer = None
-
-    # ── Cleanup ─────────────────────────────────────────────
     def cleanup(self) -> None:
-        self._cancel_close_timer()
-        if self._barrier_open:
-            self._post(self._close_url, "barrier close (cleanup)")
+        if self._barrier_open and self._db:
+            self._db.queue_command("close", source="cleanup")
         self._barrier_open = False
         logger.info("Actuator service stopped.")

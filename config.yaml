@@ -1,73 +1,65 @@
 # ============================================================
-# ANPR Gate System — Default Configuration (ESP32-CAM Edition)
+# ANPR Gate System — Configuration (Push-Based ESP32-CAM)
 # ============================================================
+# Architecture: the ESP32-CAM detects vehicles locally, captures
+# images, and POSTs them to this server for ANPR processing.
+# No port forwarding or DuckDNS required — the ESP32 only needs
+# outbound internet access (any WiFi / phone hotspot works).
 
-# ── ESP32-CAM Edge Device ──────────────────────────────────
-# The ESP32-CAM is the edge device at the gate. It hosts:
-#   - OV2640 camera (MJPEG stream + still capture)
-#   - HC-SR04 ultrasonic sensor (distance readings)
-#   - Servo + relay (barrier control)
-# All communication is over HTTP (ESP32 connects to the internet
-# and the render server connects to the ESP32's public URL).
+# ── ESP32-CAM Authentication ──────────────────────────────
+# The api_key authenticates incoming requests FROM the ESP32.
+# Must match the API_KEY constant in the ESP32 firmware.
 esp32:
-  base_url: ""                # ESP32-CAM base URL, e.g. "http://192.168.1.100" or "https://esp32-gate.example.com"
-  api_key: "3b01f25b914defb99bbb4aaca51f1f2de7fb7c66e3c47116"  # Must match API_KEY in the firmware (sent as X-Api-Key header).
-  stream_path: "/stream"      # MJPEG stream endpoint
-  capture_path: "/capture"    # Single JPEG still endpoint
-  sensor_path: "/distance"    # GET → returns JSON {"distance_cm": 42.5}
-  barrier_open_path: "/barrier/open"    # POST → opens barrier
-  barrier_close_path: "/barrier/close"  # POST → closes barrier
-  status_path: "/status"      # GET → returns JSON with full device status
-  stream_timeout_sec: 10      # Timeout for MJPEG stream connection
-  request_timeout_sec: 5      # Timeout for REST API calls
+  api_key: "3b01f25b914defb99bbb4aaca51f1f2de7fb7c66e3c47116"
+  heartbeat_timeout_sec: 120    # Consider ESP32 offline if no heartbeat for this long
 
 camera:
   resolution_width: 640
   resolution_height: 480
-  capture_count: 5            # Number of frames to capture per trigger
-  warmup_seconds: 0           # No warmup needed for ESP32 (stream is always live)
+  capture_count: 5            # Not used in push model (ESP32 sends single best frame)
+  warmup_seconds: 0
 
 sensor:
-  distance_threshold_cm: 50   # Vehicle present if distance < this
-  confirmation_readings: 3    # Consecutive readings to confirm presence
-  reading_interval_sec: 0.1   # Delay between readings
+  distance_threshold_cm: 50   # Vehicle present if distance < this (configured on ESP32 too)
+  confirmation_readings: 3    # Consecutive readings to confirm presence (ESP32-side)
+  reading_interval_sec: 0.1
 
 actuator:
   servo_open_angle: 90        # Barrier open angle (ESP32-side config)
   servo_closed_angle: 0       # Barrier closed angle (ESP32-side config)
-  open_duration_sec: 10       # Auto-close after this many seconds
-  use_servo: true             # Use servo for barrier
-  use_relay: false            # Use relay for gate motor
+  open_duration_sec: 10       # Auto-close after this many seconds (ESP32 manages this)
+  use_servo: true
+  use_relay: false
 
 detection:
   min_detection_confidence: 0.5
   min_ocr_confidence: 60      # Tesseract confidence (0-100)
-  max_retries: 3              # Retry capture/detection on failure
-  preprocessing_width: 800    # Resize target width for processing
-  plate_aspect_min: 2.0       # Minimum plate aspect ratio
-  plate_aspect_max: 6.0       # Maximum plate aspect ratio
-  min_plate_area: 1000        # Minimum contour area for plate candidate
+  max_retries: 3              # Retry detection/OCR on the same image
+  preprocessing_width: 800
+  plate_aspect_min: 2.0
+  plate_aspect_max: 6.0
+  min_plate_area: 1000
 
 ocr:
-  engine: "tesseract"         # "tesseract" or "easyocr"
-  tesseract_psm: 7            # Page segmentation mode (single line)
+  engine: "tesseract"
+  tesseract_psm: 7
   char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 paths:
   database: "data/db/anpr.db"
   events_dir: "data/events"
-  event_retention_days: 30    # Auto-delete event images older than this (0 = keep forever)
+  event_retention_days: 30
 
 web:
   host: "0.0.0.0"
   port: 5000
   debug: false
   secret_key: ""              # Flask secret key (auto-generated if empty)
-  dashboard_username: "admin"  # Web dashboard login (leave empty to disable auth)
+  dashboard_username: "admin"
   dashboard_password: "admin"  # Change this!
 
 logging:
-  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
   file: "data/anpr.log"
 
 # ── Telegram Bot ─────────────────────────────────────────────
@@ -80,7 +72,7 @@ telegram:
   enabled: true
   bot_token: ""               # YOUR BOT TOKEN from BotFather
   allowed_chat_ids: []        # e.g. [123456789]  numeric chat IDs only
-  notify_on_allow: true       # Send notification when gate opens
-  notify_on_deny: true        # Send notification when entry is denied
-  notify_on_unknown: true     # Send alert when plate is unreadable
-  send_image: true            # Attach captured image to notifications
+  notify_on_allow: true
+  notify_on_deny: true
+  notify_on_unknown: true
+  send_image: true

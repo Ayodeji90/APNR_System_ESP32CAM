@@ -1,7 +1,12 @@
 """
-ANPR System — Main Entry Point
+ANPR System — Main Entry Point (Push-Model)
 
-Initialises all services and runs the state machine.
+In the push-based architecture, the ESP32 sends images to the server.
+All ANPR processing happens in the Flask endpoint (/api/detect).
+This entry point starts:
+  - Flask web server (dashboard + ESP32 API)
+  - Telegram command handler (background thread)
+
 Usage:
     python -m src.main
     python -m src.main --config /path/to/config.yaml
@@ -11,16 +16,13 @@ import sys
 import signal
 import logging
 import argparse
+import threading
 
 from src.config import load_config, setup_logging
 from src.database import Database
 from src.sensor import UltrasonicSensor
 from src.camera import CameraService
-from src.plate_detector import PlateDetector
-from src.ocr_engine import OcrEngine
-from src.decision_engine import DecisionEngine
 from src.actuator import ActuatorController
-from src.state_machine import ANPRStateMachine
 from src.telegram_bot import TelegramNotifier
 from src.command_handler import TelegramCommandHandler
 from src.cleanup import cleanup_old_events
@@ -46,41 +48,22 @@ def main() -> None:
     setup_logging(cfg)
 
     logger.info("╔══════════════════════════════════════════╗")
-    logger.info("║    ANPR Gate System — Starting Up …      ║")
+    logger.info("║  ANPR Gate System — Push Model Starting  ║")
     logger.info("╚══════════════════════════════════════════╝")
 
     # ── Initialise core services ─────────────────────────────
     db = Database(cfg)
     sensor = UltrasonicSensor(cfg)
     camera = CameraService(cfg)
-    detector = PlateDetector(cfg)
-    ocr = OcrEngine(cfg)
-    decision_engine = DecisionEngine(cfg, db)
-    actuator = ActuatorController(cfg)
+    actuator = ActuatorController(cfg, db=db)
 
     # ── Telegram layer (optional — graceful no-op if disabled) ─
     notifier = TelegramNotifier(cfg)
     cmd_handler = TelegramCommandHandler(cfg, db, actuator, camera, None)
 
-    # ── Build state machine ──────────────────────────────────
-    sm = ANPRStateMachine(
-        cfg=cfg,
-        db=db,
-        sensor=sensor,
-        camera=camera,
-        detector=detector,
-        ocr=ocr,
-        decision_engine=decision_engine,
-        actuator=actuator,
-        notifier=notifier,
-    )
-    # Wire state machine reference into command handler
-    cmd_handler._sm = sm
-
     # ── Graceful shutdown handler ────────────────────────────
     def shutdown(signum, frame):
         logger.info("Received signal %s — shutting down …", signum)
-        sm.stop()
         cmd_handler.stop()
 
     signal.signal(signal.SIGINT, shutdown)
@@ -91,11 +74,27 @@ def main() -> None:
 
     # ── Start Telegram command listener (daemon thread) ──────
     cmd_handler.start()
-    notifier.notify_boot()   # Send "system online" message if Telegram enabled
+    notifier.notify_boot()
 
-    # ── Run state machine (blocking) ────────────────────────
+    # ── Start Flask web server (blocking) ────────────────────
+    # Import the Flask app and configure it
+    from web.app import app
+
+    logger.info(
+        "Starting Flask server on %s:%d — "
+        "ESP32 pushes to POST /api/detect and POST /api/heartbeat",
+        cfg.web.host, cfg.web.port,
+    )
+    logger.info("Dashboard at http://%s:%d", cfg.web.host, cfg.web.port)
+    logger.info("═══ ANPR System ready — waiting for ESP32 data ═══")
+
     try:
-        sm.run()
+        app.run(
+            host=cfg.web.host,
+            port=cfg.web.port,
+            debug=cfg.web.debug,
+            use_reloader=False,  # Don't reload in production
+        )
     finally:
         logger.info("Cleaning up resources …")
         actuator.cleanup()

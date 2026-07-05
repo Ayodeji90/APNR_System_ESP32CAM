@@ -101,3 +101,29 @@ class TestSettings:
         db.set_setting("key1", "value1")
         db.set_setting("key1", "value2")
         assert db.get_setting("key1") == "value2"
+
+
+class TestPendingCommands:
+    def test_queue_and_get_command(self, db):
+        db.queue_command("open", "telegram")
+        commands = db.get_pending_commands()
+        assert len(commands) == 1
+        assert commands[0]["command"] == "open"
+        assert commands[0]["source"] == "telegram"
+
+    def test_acknowledge_command(self, db):
+        cmd_id = db.queue_command("close")
+        commands = db.get_pending_commands()
+        assert len(commands) == 1
+        
+        db.acknowledge_command(cmd_id)
+        commands_after = db.get_pending_commands()
+        assert len(commands_after) == 0
+
+    def test_acknowledge_all_commands(self, db):
+        db.queue_command("open")
+        db.queue_command("close")
+        assert len(db.get_pending_commands()) == 2
+        
+        db.acknowledge_all_commands()
+        assert len(db.get_pending_commands()) == 0

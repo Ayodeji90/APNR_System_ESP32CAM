@@ -1,28 +1,22 @@
 /**
- * ANPR Gate System — ESP32-CAM Edge Firmware
- * ===========================================
+ * ANPR Gate System — ESP32-CAM Edge Firmware (Push Model)
+ * ========================================================
+ *
+ * Architecture: the ESP32 detects vehicles locally (HC-SR04),
+ * captures a JPEG, and POSTs it to the cloud server for ANPR
+ * processing.  The server responds with open/deny/unknown, and
+ * the ESP32 actuates the barrier accordingly.
+ *
+ * No port forwarding, DuckDNS, or special router config needed —
+ * the ESP32 only makes outbound HTTP requests.
  *
  * Hardware:  ESP32-CAM (AI-Thinker) + HC-SR04 + Servo + Relay
  * Platform:  PlatformIO (see platformio.ini — board: esp32cam)
- *            Compatible with Arduino-ESP32 core 2.x and 3.x.
  *
  * Build & flash:
  *   pio run                 # compile
  *   pio run -t upload       # flash (GPIO 0 → GND + press RST first)
  *   pio device monitor      # serial log (remove GPIO 0 jumper + RST)
- *
- * Endpoints exposed on the local network (port 80):
- *   GET  /stream          MJPEG live stream (multipart/x-mixed-replace)
- *   GET  /capture         Single JPEG snapshot
- *   GET  /distance        HC-SR04 distance reading → JSON {"distance_cm": 42.5}
- *   POST /barrier/open    Move servo to open angle + activate relay
- *   POST /barrier/close   Move servo to closed angle + deactivate relay
- *   GET  /status          Device info JSON (uptime, free heap, WiFi RSSI)
- *
- * Security:
- *   Set API_KEY below to a non-empty secret. When set, the barrier
- *   endpoints require either an "X-Api-Key: <key>" header or a
- *   "?key=<key>" query parameter. Leave empty to disable (LAN-only use!).
  *
  * Wiring:
  *   HC-SR04 TRIG → GPIO 12
@@ -33,14 +27,9 @@
  */
 
 #include <Arduino.h>
-
-#include <memory>
-
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
-#include <ESPmDNS.h>
-
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include "esp_camera.h"
 
 // ── Camera pin map — AI-Thinker ESP32-CAM ───────────────────
@@ -66,25 +55,30 @@
 const char* WIFI_SSID     = "Airtel_W304VA PRO_7E5A_5G";
 const char* WIFI_PASSWORD = "07048283747";
 
-// Shared secret for the barrier endpoints. STRONGLY recommended:
-// set this and send the same value from the server as an
-// "X-Api-Key" header. Empty string = authentication disabled.
+// Server URL — your GCP VM's public IP or domain
+// This is where the ESP32 POSTs images and heartbeats.
+const char* SERVER_BASE_URL = "http://YOUR_VM_IP:5000";
+
+// API key — must match esp32.api_key in the server's config.yaml
 const char* API_KEY = "3b01f25b914defb99bbb4aaca51f1f2de7fb7c66e3c47116";
 
-// Static IP (optional — comment out to use DHCP)
-// IPAddress local_IP(192, 168, 1, 200);
-// IPAddress gateway(192, 168, 1, 1);
-// IPAddress subnet(255, 255, 255, 0);
+// ── Detection thresholds ────────────────────────────────────
+#define DISTANCE_THRESHOLD_CM  50     // vehicle detected below this
+#define CONFIRMATION_READINGS   3     // consecutive readings to confirm
+#define DETECTION_COOLDOWN_MS  15000  // min time between detections
 
-// mDNS hostname (access via http://anpr-gate.local)
-const char* MDNS_HOSTNAME = "anpr-gate";
+// ── Timing ──────────────────────────────────────────────────
+#define HEARTBEAT_INTERVAL_MS  30000  // heartbeat every 30 seconds
+#define BARRIER_OPEN_DURATION_MS 10000 // auto-close after 10 seconds
+#define HTTP_TIMEOUT_MS        15000  // HTTP request timeout
+#define WIFI_RECONNECT_DELAY_MS 5000  // delay before WiFi reconnect
 
 // ── Pin definitions ─────────────────────────────────────────
 #define PIN_HCSR04_TRIG   12
 #define PIN_HCSR04_ECHO   13
 #define PIN_SERVO         14
 #define PIN_RELAY         15
-#define PIN_LED_FLASH      4   // ESP32-CAM built-in LED (optional)
+#define PIN_LED_FLASH      4
 
 // ── Servo angles ────────────────────────────────────────────
 #define SERVO_OPEN_ANGLE   90
@@ -92,46 +86,45 @@ const char* MDNS_HOSTNAME = "anpr-gate";
 
 // The camera driver claims LEDC channel 0 / timer 0 for XCLK,
 // so the servo must live on a different channel AND timer.
-// Channels 2/3 share timer 1 on the ESP32 → channel 2 is safe.
 #define SERVO_LEDC_CHANNEL  2
 
 // ── HC-SR04 constants ───────────────────────────────────────
-#define SOUND_SPEED_CM_US  0.0343f   // cm per microsecond
-#define MAX_DISTANCE_CM    400.0f    // sensor max range
-#define DISTANCE_TIMEOUT_US 25000    // ~4.3m round-trip timeout
-#define DISTANCE_POLL_INTERVAL_MS 100  // sensor polled from loop()
+#define SOUND_SPEED_CM_US  0.0343f
+#define MAX_DISTANCE_CM    400.0f
+#define DISTANCE_TIMEOUT_US 25000
+#define DISTANCE_POLL_INTERVAL_MS 100
 
 // ── Camera settings ─────────────────────────────────────────
 #define CAMERA_FRAME_SIZE  FRAMESIZE_SVGA  // 800x600
-#define CAMERA_JPEG_QUALITY 12             // 0-63, lower = better
+#define CAMERA_JPEG_QUALITY 12
 
 // ── Globals ──────────────────────────────────────────────────
-AsyncWebServer server(80);
 unsigned long bootMillis = 0;
 bool cameraOk = false;
-
-// State shared between HTTP handlers (async_tcp task) and loop().
-// Handlers only set flags / read cached values — all blocking work
-// (servo delay, HC-SR04 busy-wait) happens in loop().
-enum BarrierCommand : uint8_t { CMD_NONE = 0, CMD_OPEN, CMD_CLOSE };
-volatile uint8_t pendingBarrierCmd = CMD_NONE;
-volatile bool barrierOpen = false;
-volatile float lastDistanceCm = MAX_DISTANCE_CM;
+bool barrierOpen = false;
+float lastDistanceCm = MAX_DISTANCE_CM;
+unsigned long lastHeartbeatMs = 0;
+unsigned long lastDetectionMs = 0;
+unsigned long barrierOpenedAtMs = 0;
 
 // ── Forward declarations ────────────────────────────────────
 float readDistanceCm();
 void setServoAngle(int angle);
 void setRelay(bool on);
-void setupRoutes();
+void openBarrier();
+void closeBarrier();
+bool detectVehicle();
+void sendHeartbeat();
+void sendDetection(camera_fb_t* fb, float distanceCm);
+void processServerCommands(const char* json);
+void ensureWiFi();
 
 // ── LEDC compatibility (Arduino-ESP32 core 2.x vs 3.x) ──────
-// Core 3.x removed ledcSetup/ledcAttachPin and made ledcWrite
-// take the pin instead of the channel.
 static void servoPwmInit() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     ledcAttachChannel(PIN_SERVO, 50, 16, SERVO_LEDC_CHANNEL);
 #else
-    ledcSetup(SERVO_LEDC_CHANNEL, 50, 16);   // 50 Hz, 16-bit resolution
+    ledcSetup(SERVO_LEDC_CHANNEL, 50, 16);
     ledcAttachPin(PIN_SERVO, SERVO_LEDC_CHANNEL);
 #endif
 }
@@ -151,7 +144,7 @@ static void servoPwmWrite(uint32_t duty) {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n\n=== ANPR ESP32-CAM Edge Firmware ===");
+    Serial.println("\n\n=== ANPR ESP32-CAM — Push Model ===");
 
     // ── GPIO init ───────────────────────────────────────────
     pinMode(PIN_HCSR04_TRIG, OUTPUT);
@@ -161,7 +154,6 @@ void setup() {
     pinMode(PIN_RELAY, OUTPUT);
     digitalWrite(PIN_RELAY, LOW);
 
-    // Optional flash LED off
     pinMode(PIN_LED_FLASH, OUTPUT);
     digitalWrite(PIN_LED_FLASH, LOW);
 
@@ -193,9 +185,8 @@ void setup() {
         config.frame_size  = CAMERA_FRAME_SIZE;
         config.fb_count    = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode   = CAMERA_GRAB_LATEST;   // always serve the freshest frame
+        config.grab_mode   = CAMERA_GRAB_LATEST;
     } else {
-        // No PSRAM: SVGA double-buffering won't fit in DRAM
         config.frame_size  = FRAMESIZE_VGA;
         config.fb_count    = 1;
         config.fb_location = CAMERA_FB_IN_DRAM;
@@ -210,14 +201,12 @@ void setup() {
         Serial.println("Camera initialised OK");
     }
 
-    // Servo attached via LEDC PWM — channel 2 (camera owns channel 0)
+    // Servo init
     servoPwmInit();
     setServoAngle(SERVO_CLOSED_ANGLE);
 
     // ── WiFi ────────────────────────────────────────────────
     WiFi.mode(WIFI_STA);
-    // Optional static IP
-    // WiFi.config(local_IP, gateway, subnet);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     Serial.print("Connecting to WiFi");
@@ -232,247 +221,15 @@ void setup() {
         Serial.println("\nWiFi connected");
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
-        Serial.print("RSSI: ");
-        Serial.println(WiFi.RSSI());
-
-        // mDNS
-        if (MDNS.begin(MDNS_HOSTNAME)) {
-            Serial.printf("mDNS: http://%s.local\n", MDNS_HOSTNAME);
-        }
     } else {
-        Serial.println("\nWiFi FAILED — continuing without network");
+        Serial.println("\nWiFi FAILED — will retry in loop");
     }
 
-    if (strlen(API_KEY) == 0) {
-        Serial.println("WARNING: API_KEY is empty — barrier endpoints are UNAUTHENTICATED.");
-    }
-
-    // ── HTTP routes ─────────────────────────────────────────
-    setupRoutes();
-
-    server.begin();
     bootMillis = millis();
-    Serial.println("HTTP server started on port 80");
-    Serial.println("=== Ready ===\n");
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  AUTH GUARD
-// ═══════════════════════════════════════════════════════════════
-
-// Returns true if the request is authorized. Sends a 401 and
-// returns false otherwise. No-op (always true) when API_KEY is empty.
-static bool checkApiKey(AsyncWebServerRequest* request) {
-    if (strlen(API_KEY) == 0) return true;
-    if (request->hasHeader("X-Api-Key")
-        && request->getHeader("X-Api-Key")->value() == API_KEY) {
-        return true;
-    }
-    if (request->hasParam("key")
-        && request->getParam("key")->value() == API_KEY) {
-        return true;
-    }
-    request->send(401, "application/json", "{\"error\": \"unauthorized\"}");
-    return false;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  MJPEG STREAM STATE
-// ═══════════════════════════════════════════════════════════════
-
-// Per-client state for the chunked MJPEG stream. A full SVGA JPEG
-// (20-40 KB) never fits in one AsyncWebServer chunk buffer (~1.4-5.7 KB),
-// so each frame is sent across many chunk callbacks: the state tracks
-// how much of the current part (header + JPEG body) has gone out.
-struct MjpegStreamState {
-    camera_fb_t* fb = nullptr;
-    char header[96];
-    size_t headerLen = 0;
-    size_t headerSent = 0;
-    size_t bodySent = 0;
-
-    ~MjpegStreamState() {
-        // Client disconnected mid-frame — return the buffer to the driver
-        if (fb) esp_camera_fb_return(fb);
-    }
-};
-
-// Fill one chunk of the MJPEG stream. Returns bytes written;
-// returning 0 ends the stream (camera failure).
-static size_t fillStreamChunk(MjpegStreamState* st, uint8_t* buffer, size_t maxLen) {
-    // Start a new part if no frame is in flight
-    if (st->fb == nullptr) {
-        st->fb = esp_camera_fb_get();
-        if (st->fb == nullptr) {
-            return 0;  // camera failure — terminate the stream
-        }
-        // Leading CRLF terminates the previous part (harmless preamble
-        // before the very first boundary), so no trailer state is needed.
-        st->headerLen = snprintf(
-            st->header, sizeof(st->header),
-            "\r\n--FRAME_BOUNDARY\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "Content-Length: %u\r\n"
-            "\r\n",
-            (unsigned)st->fb->len
-        );
-        st->headerSent = 0;
-        st->bodySent = 0;
-    }
-
-    size_t written = 0;
-
-    // Send any remaining header bytes
-    if (st->headerSent < st->headerLen) {
-        size_t n = std::min(maxLen, st->headerLen - st->headerSent);
-        memcpy(buffer, st->header + st->headerSent, n);
-        st->headerSent += n;
-        written = n;
-        if (written == maxLen) return written;
-    }
-
-    // Send the next slice of the JPEG body
-    size_t remaining = st->fb->len - st->bodySent;
-    size_t n = std::min(maxLen - written, remaining);
-    memcpy(buffer + written, st->fb->buf + st->bodySent, n);
-    st->bodySent += n;
-    written += n;
-
-    // Frame complete — release it; next callback grabs a fresh one
-    if (st->bodySent == st->fb->len) {
-        esp_camera_fb_return(st->fb);
-        st->fb = nullptr;
-    }
-
-    return written;
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  ROUTES
-// ═══════════════════════════════════════════════════════════════
-
-void setupRoutes() {
-
-    // ── MJPEG Stream ────────────────────────────────────────
-    server.on("/stream", HTTP_GET, [](AsyncWebServerRequest* request) {
-        if (!cameraOk) {
-            request->send(503, "application/json", "{\"error\": \"camera not initialised\"}");
-            return;
-        }
-        // shared_ptr keeps the state alive for the lifetime of the
-        // response and its destructor returns any in-flight frame.
-        auto state = std::make_shared<MjpegStreamState>();
-        AsyncWebServerResponse* response = request->beginChunkedResponse(
-            "multipart/x-mixed-replace; boundary=FRAME_BOUNDARY",
-            [state](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
-                return fillStreamChunk(state.get(), buffer, maxLen);
-            }
-        );
-        response->addHeader("Access-Control-Allow-Origin", "*");
-        request->send(response);
-    });
-
-    // ── Single JPEG Capture ─────────────────────────────────
-    server.on("/capture", HTTP_GET, [](AsyncWebServerRequest* request) {
-        if (!cameraOk) {
-            request->send(503, "application/json", "{\"error\": \"camera not initialised\"}");
-            return;
-        }
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (!fb) {
-            request->send(500, "text/plain", "Camera capture failed");
-            return;
-        }
-
-        // AsyncWebServer transmits AFTER this handler returns, so the
-        // framebuffer must be copied — returning it here and letting the
-        // response reference fb->buf would be a use-after-free.
-        size_t len = fb->len;
-        uint8_t* copy = (uint8_t*)ps_malloc(len);
-        if (copy == nullptr) copy = (uint8_t*)malloc(len);
-        if (copy == nullptr) {
-            esp_camera_fb_return(fb);
-            request->send(500, "text/plain", "Out of memory");
-            return;
-        }
-        memcpy(copy, fb->buf, len);
-        esp_camera_fb_return(fb);
-
-        AsyncWebServerResponse* response = request->beginResponse(
-            "image/jpeg", len,
-            [copy, len](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
-                size_t n = std::min(maxLen, len - index);
-                memcpy(buffer, copy + index, n);
-                return n;
-            }
-        );
-        response->addHeader("Access-Control-Allow-Origin", "*");
-        request->onDisconnect([copy]() { free(copy); });
-        request->send(response);
-    });
-
-    // ── Distance (HC-SR04) ──────────────────────────────────
-    // Returns the cached reading polled from loop() — the busy-wait
-    // measurement must not run on the async_tcp task.
-    server.on("/distance", HTTP_GET, [](AsyncWebServerRequest* request) {
-        char json[64];
-        snprintf(json, sizeof(json), "{\"distance_cm\": %.1f}", (float)lastDistanceCm);
-        AsyncWebServerResponse* response = request->beginResponse(
-            200, "application/json", json
-        );
-        response->addHeader("Access-Control-Allow-Origin", "*");
-        request->send(response);
-    });
-
-    // ── Barrier Open ────────────────────────────────────────
-    // Handlers only queue the command; the servo move (with its
-    // 400 ms settle delay) runs in loop().
-    server.on("/barrier/open", HTTP_POST, [](AsyncWebServerRequest* request) {
-        if (!checkApiKey(request)) return;
-        pendingBarrierCmd = CMD_OPEN;
-        Serial.println("Barrier OPEN queued");
-        request->send(200, "application/json", "{\"status\": \"open\"}");
-    });
-
-    // ── Barrier Close ───────────────────────────────────────
-    server.on("/barrier/close", HTTP_POST, [](AsyncWebServerRequest* request) {
-        if (!checkApiKey(request)) return;
-        pendingBarrierCmd = CMD_CLOSE;
-        Serial.println("Barrier CLOSE queued");
-        request->send(200, "application/json", "{\"status\": \"closed\"}");
-    });
-
-    // ── Device Status ───────────────────────────────────────
-    server.on("/status", HTTP_GET, [](AsyncWebServerRequest* request) {
-        unsigned long uptime = (millis() - bootMillis) / 1000;
-        char json[256];
-        snprintf(json, sizeof(json),
-            "{"
-            "\"uptime_sec\": %lu,"
-            "\"free_heap\": %u,"
-            "\"wifi_rssi\": %d,"
-            "\"wifi_ip\": \"%s\","
-            "\"barrier_open\": %s,"
-            "\"camera_ok\": %s"
-            "}",
-            uptime,
-            (unsigned)ESP.getFreeHeap(),
-            WiFi.RSSI(),
-            WiFi.localIP().toString().c_str(),
-            barrierOpen ? "true" : "false",
-            cameraOk ? "true" : "false"
-        );
-        AsyncWebServerResponse* response = request->beginResponse(
-            200, "application/json", json
-        );
-        response->addHeader("Access-Control-Allow-Origin", "*");
-        request->send(response);
-    });
-
-    // ── 404 catch-all ───────────────────────────────────────
-    server.onNotFound([](AsyncWebServerRequest* request) {
-        request->send(404, "application/json", "{\"error\": \"not found\"}");
-    });
+    Serial.printf("Server: %s\n", SERVER_BASE_URL);
+    Serial.printf("Detection threshold: %dcm, confirmations: %d\n",
+                  DISTANCE_THRESHOLD_CM, CONFIRMATION_READINGS);
+    Serial.println("=== Ready — Push Model Active ===\n");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -480,27 +237,20 @@ void setupRoutes() {
 // ═══════════════════════════════════════════════════════════════
 
 float readDistanceCm() {
-    // Send 10µs trigger pulse
     digitalWrite(PIN_HCSR04_TRIG, LOW);
     delayMicroseconds(2);
     digitalWrite(PIN_HCSR04_TRIG, HIGH);
     delayMicroseconds(10);
     digitalWrite(PIN_HCSR04_TRIG, LOW);
 
-    // Measure echo pulse duration with timeout
-    unsigned long pulseStart = micros();
-    unsigned long timeoutStart = pulseStart;
-
-    // Wait for echo HIGH
+    unsigned long timeoutStart = micros();
     while (digitalRead(PIN_HCSR04_ECHO) == LOW) {
         if (micros() - timeoutStart > DISTANCE_TIMEOUT_US) {
-            return MAX_DISTANCE_CM;  // no echo — object too far or sensor fault
+            return MAX_DISTANCE_CM;
         }
     }
 
-    pulseStart = micros();
-
-    // Wait for echo LOW
+    unsigned long pulseStart = micros();
     while (digitalRead(PIN_HCSR04_ECHO) == HIGH) {
         if (micros() - pulseStart > DISTANCE_TIMEOUT_US) {
             return MAX_DISTANCE_CM;
@@ -509,11 +259,7 @@ float readDistanceCm() {
 
     unsigned long pulseDuration = micros() - pulseStart;
     float distance = pulseDuration * SOUND_SPEED_CM_US / 2.0f;
-
-    if (distance > MAX_DISTANCE_CM) {
-        distance = MAX_DISTANCE_CM;
-    }
-
+    if (distance > MAX_DISTANCE_CM) distance = MAX_DISTANCE_CM;
     return distance;
 }
 
@@ -522,15 +268,12 @@ float readDistanceCm() {
 // ═══════════════════════════════════════════════════════════════
 
 void setServoAngle(int angle) {
-    // SG90/MG996R: 0° ≈ 500µs pulse, 180° ≈ 2400µs pulse
-    // 50 Hz → period = 20000µs
-    // duty = (500 + angle * (1900/180)) / 20000 * 65536
     int angleClamped = constrain(angle, 0, 180);
     int pulseUs = map(angleClamped, 0, 180, 500, 2400);
     uint32_t duty = (uint32_t)pulseUs * 65536 / 20000;
     servoPwmWrite(duty);
-    delay(400);  // allow servo to reach position
-    servoPwmWrite(0);  // stop PWM to prevent jitter
+    delay(400);
+    servoPwmWrite(0);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -542,50 +285,279 @@ void setRelay(bool on) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  MAIN LOOP
+//  BARRIER CONTROL
 // ═══════════════════════════════════════════════════════════════
-// All blocking work lives here: HC-SR04 polling, servo moves
-// queued by the HTTP handlers, and the periodic heartbeat.
 
-void loop() {
-    static unsigned long lastDistancePollMs = 0;
-    static unsigned long lastHeartbeatMs = 0;
+void openBarrier() {
+    if (!barrierOpen) {
+        Serial.println("Opening barrier …");
+        setServoAngle(SERVO_OPEN_ANGLE);
+        setRelay(true);
+        barrierOpen = true;
+        barrierOpenedAtMs = millis();
+        Serial.println("Barrier OPENED");
+    }
+}
 
-    // ── Execute queued barrier commands ─────────────────────
-    uint8_t cmd = pendingBarrierCmd;
-    if (cmd != CMD_NONE) {
-        pendingBarrierCmd = CMD_NONE;
-        if (cmd == CMD_OPEN) {
-            setServoAngle(SERVO_OPEN_ANGLE);
-            setRelay(true);
-            barrierOpen = true;
-            Serial.println("Barrier OPENED");
-        } else if (cmd == CMD_CLOSE) {
-            setServoAngle(SERVO_CLOSED_ANGLE);
-            setRelay(false);
-            barrierOpen = false;
-            Serial.println("Barrier CLOSED");
+void closeBarrier() {
+    if (barrierOpen) {
+        Serial.println("Closing barrier …");
+        setServoAngle(SERVO_CLOSED_ANGLE);
+        setRelay(false);
+        barrierOpen = false;
+        Serial.println("Barrier CLOSED");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VEHICLE DETECTION (LOCAL)
+// ═══════════════════════════════════════════════════════════════
+
+bool detectVehicle() {
+    int consecutive = 0;
+    for (int i = 0; i < CONFIRMATION_READINGS + 2; i++) {
+        float dist = readDistanceCm();
+        if (dist < DISTANCE_THRESHOLD_CM) {
+            consecutive++;
+            if (consecutive >= CONFIRMATION_READINGS) {
+                Serial.printf("Vehicle detected at %.1f cm\n", dist);
+                return true;
+            }
+        } else {
+            consecutive = 0;
+        }
+        delay(100);
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  WIFI RECONNECTION
+// ═══════════════════════════════════════════════════════════════
+
+void ensureWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    Serial.println("WiFi disconnected — reconnecting …");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi reconnected");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi reconnect failed — will retry later");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SERVER COMMUNICATION
+// ═══════════════════════════════════════════════════════════════
+
+void sendDetection(camera_fb_t* fb, float distanceCm) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Cannot send detection — WiFi offline");
+        return;
+    }
+
+    HTTPClient http;
+    String url = String(SERVER_BASE_URL) + "/api/detect";
+
+    http.begin(url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("X-Api-Key", API_KEY);
+
+    // Build multipart/form-data
+    String boundary = "----ESP32Boundary";
+    String contentType = "multipart/form-data; boundary=" + boundary;
+    http.addHeader("Content-Type", contentType);
+
+    // Build the body
+    String bodyStart = "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"distance_cm\"\r\n\r\n"
+        + String(distanceCm, 1) + "\r\n"
+        "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n";
+    String bodyEnd = "\r\n--" + boundary + "--\r\n";
+
+    size_t totalLen = bodyStart.length() + fb->len + bodyEnd.length();
+
+    // Allocate buffer
+    uint8_t* payload = (uint8_t*)ps_malloc(totalLen);
+    if (!payload) payload = (uint8_t*)malloc(totalLen);
+    if (!payload) {
+        Serial.println("Out of memory for HTTP payload");
+        http.end();
+        return;
+    }
+
+    size_t offset = 0;
+    memcpy(payload + offset, bodyStart.c_str(), bodyStart.length());
+    offset += bodyStart.length();
+    memcpy(payload + offset, fb->buf, fb->len);
+    offset += fb->len;
+    memcpy(payload + offset, bodyEnd.c_str(), bodyEnd.length());
+
+    Serial.printf("Sending detection to server (%d bytes) …\n", totalLen);
+    int httpCode = http.POST(payload, totalLen);
+    free(payload);
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        Serial.printf("Server response: %s\n", response.c_str());
+
+        // Parse JSON response
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, response);
+        if (!err) {
+            const char* action = doc["action"] | "unknown";
+            const char* plate = doc["plate"] | "";
+            const char* reason = doc["reason"] | "";
+
+            Serial.printf("Action: %s  Plate: %s  Reason: %s\n", action, plate, reason);
+
+            if (strcmp(action, "open") == 0) {
+                openBarrier();
+            }
+        } else {
+            Serial.printf("JSON parse error: %s\n", err.c_str());
+        }
+    } else {
+        Serial.printf("HTTP error: %d\n", httpCode);
+        if (httpCode > 0) {
+            Serial.println(http.getString());
         }
     }
 
-    // ── Poll HC-SR04 into the cached reading ────────────────
+    http.end();
+}
+
+
+void sendHeartbeat() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    String url = String(SERVER_BASE_URL) + "/api/heartbeat";
+
+    http.begin(url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", API_KEY);
+
+    // Build heartbeat JSON
+    JsonDocument doc;
+    doc["uptime_sec"] = (millis() - bootMillis) / 1000;
+    doc["free_heap"]  = ESP.getFreeHeap();
+    doc["wifi_rssi"]  = WiFi.RSSI();
+    doc["barrier_open"] = barrierOpen;
+    doc["distance_cm"]  = lastDistanceCm;
+
+    String body;
+    serializeJson(doc, body);
+
+    int httpCode = http.POST(body);
+    if (httpCode == 200) {
+        String response = http.getString();
+
+        // Parse response for pending commands
+        JsonDocument respDoc;
+        DeserializationError err = deserializeJson(respDoc, response);
+        if (!err) {
+            JsonArray commands = respDoc["commands"].as<JsonArray>();
+            for (JsonObject cmd : commands) {
+                const char* command = cmd["command"] | "";
+                int cmdId = cmd["id"] | 0;
+                Serial.printf("Pending command: %s (id=%d)\n", command, cmdId);
+
+                if (strcmp(command, "open") == 0) {
+                    openBarrier();
+                } else if (strcmp(command, "close") == 0) {
+                    closeBarrier();
+                }
+            }
+        }
+    } else {
+        Serial.printf("Heartbeat failed: HTTP %d\n", httpCode);
+    }
+
+    http.end();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════
+
+void loop() {
+    static unsigned long lastDistancePollMs = 0;
+
+    // ── Ensure WiFi is connected ────────────────────────────
+    ensureWiFi();
+
+    // ── Auto-close barrier after timeout ────────────────────
+    if (barrierOpen && (millis() - barrierOpenedAtMs >= BARRIER_OPEN_DURATION_MS)) {
+        Serial.println("Auto-close timer fired");
+        closeBarrier();
+    }
+
+    // ── Poll distance sensor ────────────────────────────────
     if (millis() - lastDistancePollMs >= DISTANCE_POLL_INTERVAL_MS) {
         lastDistancePollMs = millis();
         lastDistanceCm = readDistanceCm();
     }
 
-    // ── 1-minute heartbeat ──────────────────────────────────
-    if (millis() - lastHeartbeatMs >= 60000) {
-        lastHeartbeatMs = millis();
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[HEARTBEAT] uptime=%lus  heap=%u  rssi=%d  barrier=%s  dist=%.1fcm\n",
-                (millis() - bootMillis) / 1000,
-                (unsigned)ESP.getFreeHeap(),
-                WiFi.RSSI(),
-                barrierOpen ? "open" : "closed",
-                (float)lastDistanceCm
-            );
+    // ── Vehicle detection → capture → send to server ────────
+    if (!barrierOpen &&
+        (millis() - lastDetectionMs >= DETECTION_COOLDOWN_MS) &&
+        lastDistanceCm < DISTANCE_THRESHOLD_CM)
+    {
+        // Confirm with multiple readings
+        if (detectVehicle()) {
+            Serial.println("▶ Vehicle confirmed — capturing image …");
+            lastDetectionMs = millis();
+
+            if (cameraOk) {
+                // Flash LED briefly for better capture
+                digitalWrite(PIN_LED_FLASH, HIGH);
+                delay(100);
+
+                camera_fb_t* fb = esp_camera_fb_get();
+                digitalWrite(PIN_LED_FLASH, LOW);
+
+                if (fb) {
+                    Serial.printf("Captured %d bytes JPEG\n", fb->len);
+                    sendDetection(fb, lastDistanceCm);
+                    esp_camera_fb_return(fb);
+                } else {
+                    Serial.println("Camera capture failed");
+                }
+            } else {
+                Serial.println("Camera not available — skipping detection");
+            }
         }
+    }
+
+    // ── Periodic heartbeat ──────────────────────────────────
+    if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+        lastHeartbeatMs = millis();
+        sendHeartbeat();
+
+        // Log status
+        Serial.printf("[HEARTBEAT] uptime=%lus  heap=%u  rssi=%d  barrier=%s  dist=%.1fcm\n",
+            (millis() - bootMillis) / 1000,
+            (unsigned)ESP.getFreeHeap(),
+            WiFi.RSSI(),
+            barrierOpen ? "open" : "closed",
+            lastDistanceCm
+        );
     }
 
     delay(10);
