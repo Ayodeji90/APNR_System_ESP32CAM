@@ -399,8 +399,18 @@ class OcrEngine:
     # ── Helpers ─────────────────────────────────────────────
     @staticmethod
     def normalize_plate(text: str) -> str:
-        """Uppercase and strip to A–Z / 0–9 only."""
-        return re.sub(r"[^A-Z0-9]", "", text.upper().strip())
+        """Uppercase, remove common Nigerian plate stopwords, and strip to A-Z / 0-9 only."""
+        text = text.upper()
+        # Nigerian plate stop words (state names, slogans) that OCR might read
+        stopwords = [
+            "LAGOS", "CENTRE", "EXCELLENCE", "FEDERAL", "REPUBLIC", "NIGERIA",
+            "ABUJA", "KANO", "RIVERS", "OGUN", "OYO", "KADUNA", "EDO",
+            "ENUGU", "DELTA", "KWARA", "ONDO", "OSUN", "PLATEAU", "NIGER",
+            "STATE", "OF", "10LAGOS", "IOLAGOS"
+        ]
+        for word in stopwords:
+            text = text.replace(word, "")
+        return re.sub(r"[^A-Z0-9]", "", text.strip())
 
     @staticmethod
     def _to_float(value) -> float:
