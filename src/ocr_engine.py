@@ -401,16 +401,17 @@ class OcrEngine:
     def normalize_plate(text: str) -> str:
         """Uppercase, remove common Nigerian plate stopwords, and strip to A-Z / 0-9 only."""
         text = text.upper()
-        # Nigerian plate stop words (state names, slogans) that OCR might read
-        stopwords = [
-            "LAGOS", "CENTRE", "EXCELLENCE", "FEDERAL", "REPUBLIC", "NIGERIA",
-            "ABUJA", "KANO", "RIVERS", "OGUN", "OYO", "KADUNA", "EDO",
-            "ENUGU", "DELTA", "KWARA", "ONDO", "OSUN", "PLATEAU", "NIGER",
-            "STATE", "OF", "10LAGOS", "IOLAGOS"
-        ]
-        for word in stopwords:
-            text = text.replace(word, "")
-        return re.sub(r"[^A-Z0-9]", "", text.strip())
+        # Aggressively remove variations of state names and slogans
+        text = re.sub(r'(?:[01IO]*LAGOS|CENT[A-Z]*|EXCEL[A-Z]*|FEDER[A-Z]*|REPUBL[A-Z]*|NIGER[A-Z]*|STATE|ABUJA|KANO|RIVERS|OGUN|OYO|KADUNA|EDO|ENUGU|DELTA|KWARA|ONDO|OSUN|PLATEAU)', '', text)
+        
+        normalized = re.sub(r"[^A-Z0-9]", "", text.strip())
+        
+        # A valid Nigerian plate MUST contain at least one digit and at least one letter.
+        # If it doesn't (e.g. "CENTCN", "OLAGOS"), it's definitely garbage text.
+        if not re.search(r'\d', normalized) or not re.search(r'[A-Z]', normalized):
+            return ""
+            
+        return normalized
 
     @staticmethod
     def _to_float(value) -> float:
