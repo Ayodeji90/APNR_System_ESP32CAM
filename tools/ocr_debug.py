@@ -72,6 +72,13 @@ def main() -> None:
     except Exception as e:
         print(f"Could not build binarisation preview: {e}")
 
+    # ── Dump ALL raw OCR candidates (the key diagnostic) ────
+    # Shows whether the registration number is being READ at all vs being
+    # read but not selected.
+    _dump_candidates(ocr, target, "detected crop" if crop is not None else "full frame")
+    if crop is not None:
+        _dump_candidates(ocr, frame, "full frame")
+
     # ── OCR (crop, then full-frame fallback) ────────────────
     print("\n--- OCR on detected crop ---")
     text, conf = (ocr.read_plate(crop, enhanced=True) if crop is not None else ("", 0.0))
@@ -87,6 +94,30 @@ def main() -> None:
     print(f"  ocr_conf   = {conf:.1f}   (min_ocr_confidence={cfg.detection.min_ocr_confidence})")
     print(f"  whitelisted = {ocr.normalize_plate(text) and _whitelisted(cfg, text)}")
     print()
+
+
+def _dump_candidates(ocr, image, label: str) -> None:
+    """Print every OCR candidate from every binarisation × PSM combo."""
+    print(f"\n--- ALL raw candidates on {label} ---")
+    seen = {}
+    for bi, binary in enumerate(ocr._binarisations(image)):
+        for psm in (7, 6, 11, 8):
+            for raw, conf, height in ocr._ocr_candidates(binary, psm):
+                text = ocr.normalize_plate(raw)
+                if len(text) < 4:
+                    continue
+                rank = ocr._pattern_rank(text)
+                # keep the best-scoring appearance of each distinct text
+                key = (rank, -height, -conf)
+                if text not in seen or key < seen[text][0]:
+                    seen[text] = (key, conf, height, rank, bi, psm)
+    if not seen:
+        print("  (no candidates ≥4 chars)")
+        return
+    # Sort by the same key the engine uses to pick the winner
+    for text, (key, conf, height, rank, bi, psm) in sorted(seen.items(), key=lambda kv: kv[1][0]):
+        print(f"  '{text:<10}' rank={rank} height={height:>4.0f}px "
+              f"conf={conf:>5.1f}  [bin#{bi} psm{psm}]")
 
 
 def _whitelisted(cfg, text: str) -> bool:

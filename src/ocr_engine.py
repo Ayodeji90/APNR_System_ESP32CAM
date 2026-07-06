@@ -86,14 +86,30 @@ class OcrEngine:
             _, o_green = cv2.threshold(green, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             variants += [o_min, o_green]
 
+            # Hue-isolation: keep ONLY the purple/blue registration characters,
+            # discarding the green state map behind the digits and the black
+            # "LAGOS" text. This is what lets "123" read cleanly despite the map.
+            hsv = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2HSV)
+            purple = cv2.inRange(hsv, (100, 40, 40), (165, 255, 255))
+            purple = cv2.morphologyEx(
+                purple, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+            )
+            purple = self.preprocessor.upscale_min_width(purple, 400)
+            # Characters are white in the mask → invert to dark-on-white.
+            variants.append(cv2.bitwise_not(purple))
+
         return variants
 
     # ── Raw OCR over one image ──────────────────────────────
-    def _ocr_candidates(self, image: np.ndarray, psm: int) -> List[Tuple[str, float]]:
+    def _ocr_candidates(self, image: np.ndarray, psm: int) -> List[Tuple[str, float, float]]:
         """
-        Run Tesseract and return candidate (text, confidence) tuples:
+        Run Tesseract and return candidate (text, confidence, height) tuples:
         both individual words and per-line concatenations (so a number
         split as "GGE 123 ZY" is recombined into "GGE123ZY").
+
+        `height` is the character height in pixels — the registration number
+        is the tallest text on a plate, so this lets the scorer prefer it
+        over region names ("LAGOS") and slogans.
         """
         if not _HAS_TESSERACT:
             return []
@@ -107,7 +123,7 @@ class OcrEngine:
             logger.error("Tesseract failed: %s", e)
             return []
 
-        candidates: List[Tuple[str, float]] = []
+        candidates: List[Tuple[str, float, float]] = []
         # Group words by text line so multi-token numbers recombine.
         lines: dict = {}
         for i, word in enumerate(data["text"]):
@@ -115,17 +131,19 @@ class OcrEngine:
             word = word.strip()
             if not word or conf <= 0:
                 continue
-            # Individual word candidate
-            candidates.append((word, conf))
+            height = self._to_float(data["height"][i])
+            candidates.append((word, conf, height))
             key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines.setdefault(key, {"words": [], "confs": []})
+            lines.setdefault(key, {"words": [], "confs": [], "heights": []})
             lines[key]["words"].append(word)
             lines[key]["confs"].append(conf)
+            lines[key]["heights"].append(height)
 
         for grp in lines.values():
             joined = "".join(grp["words"])
             mean_conf = sum(grp["confs"]) / len(grp["confs"])
-            candidates.append((joined, mean_conf))
+            max_height = max(grp["heights"])
+            candidates.append((joined, mean_conf, max_height))
 
         return candidates
 
@@ -155,24 +173,28 @@ class OcrEngine:
 
         best_text = ""
         best_conf = 0.0
-        best_rank = len(_PLATE_PATTERNS) + 1
+        best_key = None  # (rank, -height, -conf); lower is better
 
         for binary in self._binarisations(plate_crop):
             for psm in psm_modes:
-                for raw, conf in self._ocr_candidates(binary, psm):
+                for raw, conf, height in self._ocr_candidates(binary, psm):
                     text = self.normalize_plate(raw)
                     if len(text) < 4:  # too short to be a plate
                         continue
                     rank = self._pattern_rank(text)
-                    # Prefer better pattern match; break ties by confidence.
-                    if rank < best_rank or (rank == best_rank and conf > best_conf):
-                        best_rank = rank
+                    # Prefer a real plate-pattern match first; then the
+                    # TALLEST text (the registration number dominates the
+                    # plate); then confidence. Height selection stops small
+                    # high-confidence text like "LAGOS" from winning.
+                    key = (rank, -height, -conf)
+                    if best_key is None or key < best_key:
+                        best_key = key
                         best_text = text
                         best_conf = conf
 
         logger.info(
-            "OCR result: plate='%s' confidence=%.1f rank=%d enhanced=%s",
-            best_text, best_conf, best_rank, enhanced,
+            "OCR result: plate='%s' confidence=%.1f enhanced=%s",
+            best_text, best_conf, enhanced,
         )
         return (best_text, best_conf)
 
