@@ -156,7 +156,12 @@ class OcrEngine:
         adaptive = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 9
         )
-        variants += [otsu, cv2.bitwise_not(otsu), adaptive]
+        # Larger block/C — makes the coloured characters stand out on the
+        # brighter plate body (wider neighbourhood handles the map shading).
+        adaptive_wide = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+        )
+        variants += [otsu, cv2.bitwise_not(otsu), adaptive, adaptive_wide]
 
         # 2) Colour-aware paths (only for BGR input)
         if plate_crop.ndim == 3:
@@ -198,7 +203,10 @@ class OcrEngine:
         if not _HAS_TESSERACT:
             return []
 
-        config = f"--psm {psm} -c tessedit_char_whitelist={self.whitelist}"
+        config = (
+            f"--oem 3 --psm {psm} "
+            f"-c tessedit_char_whitelist={self.whitelist}"
+        )
         try:
             data = pytesseract.image_to_data(
                 image, config=config, output_type=pytesseract.Output.DICT
