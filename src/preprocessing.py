@@ -101,6 +101,30 @@ class ImagePreprocessor:
         """Canny edge detection."""
         return cv2.Canny(image, low, high)
 
+    @staticmethod
+    def clahe(image: np.ndarray, clip: float = 3.0, grid: int = 8) -> np.ndarray:
+        """Contrast Limited Adaptive Histogram Equalisation.
+
+        Lifts detail out of dark/unevenly-lit frames — essential for the
+        low-light plate captures this system sees.
+        """
+        gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid))
+        return clahe.apply(gray)
+
+    @staticmethod
+    def upscale_min_width(image: np.ndarray, min_width: int = 400) -> np.ndarray:
+        """Upscale a small crop so characters are big enough for Tesseract.
+
+        Tesseract wants roughly 30px+ character height; tiny plate crops
+        OCR far better after cubic upscaling.
+        """
+        h, w = image.shape[:2]
+        if w == 0 or w >= min_width:
+            return image
+        scale = min_width / w
+        return cv2.resize(image, (min_width, int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
     # ── Full pipeline ───────────────────────────────────────
     def preprocess_for_detection(self, image: np.ndarray) -> np.ndarray:
         """

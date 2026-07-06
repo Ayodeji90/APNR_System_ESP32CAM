@@ -192,41 +192,34 @@ def api_detect():
     plate_text = ""
     ocr_conf = 0.0
     detection_conf = 0.0
-    decision = Decision.UNKNOWN
-    reason = ""
 
-    # Retry loop (same image, different preprocessing)
-    max_retries = _cfg.detection.max_retries
-    for attempt in range(max_retries + 1):
-        # Detect plate region
-        plate_crop, det_conf = detector.detect(frame)
-        if plate_crop is None:
-            if attempt < max_retries:
-                logger.info("No plate found (attempt %d/%d) — retrying", attempt + 1, max_retries)
-                continue
-            # FALLBACK: If we couldn't find a perfect rectangle after all retries,
-            # just pass the entire image to the OCR engine!
-            logger.warning("Falling back to full-frame OCR (no plate border detected)")
-            plate_crop = frame
-            det_conf = 0.1
+    # ── Detect plate region, then OCR ───────────────────────
+    plate_crop, detection_conf = detector.detect(frame)
 
-        detection_conf = det_conf
-
-        # OCR — standard first, then enhanced if low confidence
+    if plate_crop is not None:
+        # OCR the localised crop — standard pass, then enhanced.
         text, conf = ocr.read_plate(plate_crop, enhanced=False)
         if conf < _cfg.detection.min_ocr_confidence:
             text2, conf2 = ocr.read_plate(plate_crop, enhanced=True)
             if conf2 > conf:
                 text, conf = text2, conf2
+        plate_text, ocr_conf = text, conf
 
-        plate_text = text
-        ocr_conf = conf
+    # ── Full-frame fallback ─────────────────────────────────
+    # If localisation failed or produced no readable text, OCR the whole
+    # (contrast-boosted) frame. Assign a mid detection score so a strong,
+    # whitelisted read can still open the gate.
+    if not plate_text:
+        logger.info("Crop OCR empty — falling back to full-frame OCR")
+        text, conf = ocr.read_plate(frame, enhanced=True)
+        if text:
+            plate_text, ocr_conf = text, conf
+            detection_conf = max(detection_conf, _cfg.detection.min_detection_confidence)
 
-        # Decision
-        result = decision_engine.decide(plate_text, ocr_conf, detection_conf)
-        decision = result.decision
-        reason = result.reason
-        break
+    # ── Decision ────────────────────────────────────────────
+    result = decision_engine.decide(plate_text, ocr_conf, detection_conf)
+    decision = result.decision
+    reason = result.reason
 
     # ── Save evidence image ─────────────────────────────────
     image_path = ""

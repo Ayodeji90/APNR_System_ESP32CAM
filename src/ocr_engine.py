@@ -1,13 +1,20 @@
 """
 ANPR System — OCR Engine (Tesseract)
 
-Reads text from a cropped license plate image using Tesseract OCR.
-Normalizes the output and returns a confidence score.
+Reads a plate registration number from a cropped (or full-frame) plate
+image.  Robust to dark, stylised, multi-line plates:
+
+  - CLAHE contrast boost + cubic upscaling
+  - several binarisations tried (Otsu, inverted Otsu, adaptive)
+  - several Tesseract page-segmentation modes tried (block / line / sparse)
+  - candidate strings scored against a licence-plate pattern, so the
+    registration number is extracted even when the plate also carries
+    region names and slogans (e.g. "LAGOS", "CENTRE OF EXCELLENCE").
 """
 
 import re
 import logging
-from typing import Tuple
+from typing import Tuple, List
 
 import cv2
 import numpy as np
@@ -28,96 +35,134 @@ except ImportError:
         "Install: pip install pytesseract  +  sudo apt install tesseract-ocr"
     )
 
+# Plate-number patterns, most specific first. GGE123ZY (Nigerian current
+# format: 3 letters, 3 digits, 2 letters) matches the first pattern.
+_PLATE_PATTERNS = [
+    re.compile(r"[A-Z]{3}[0-9]{2,3}[A-Z]{2}"),   # AAA000AA (Nigerian)
+    re.compile(r"[A-Z]{2,3}[0-9]{2,4}[A-Z]{1,3}"),  # looser letter-digit-letter
+    re.compile(r"[A-Z0-9]{5,9}"),                 # generic alnum fallback
+]
+
 
 class OcrEngine:
-    """Tesseract-based OCR for license plate text reading."""
+    """Tesseract-based OCR for licence-plate text reading."""
 
     def __init__(self, cfg: AppConfig):
         self.psm = cfg.ocr.tesseract_psm
         self.whitelist = cfg.ocr.char_whitelist
         self.preprocessor = ImagePreprocessor(cfg)
 
-    # ── Raw OCR ─────────────────────────────────────────────
-    def _run_tesseract(self, image: np.ndarray) -> Tuple[str, float]:
-        """
-        Run Tesseract on a preprocessed image.
+    # ── Binarisation variants ───────────────────────────────
+    def _binarisations(self, plate_crop: np.ndarray) -> List[np.ndarray]:
+        """Produce several binary images to feed Tesseract."""
+        gray = self.preprocessor.clahe(plate_crop)
+        gray = self.preprocessor.upscale_min_width(gray, 400)
+        gray = cv2.bilateralFilter(gray, 11, 17, 17)
 
-        Returns:
-            (raw_text, mean_confidence)
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        adaptive = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 9
+        )
+        # Dark chars on light plate → otsu; light chars on dark → inverted.
+        return [otsu, cv2.bitwise_not(otsu), adaptive]
+
+    # ── Raw OCR over one image ──────────────────────────────
+    def _ocr_candidates(self, image: np.ndarray, psm: int) -> List[Tuple[str, float]]:
+        """
+        Run Tesseract and return candidate (text, confidence) tuples:
+        both individual words and per-line concatenations (so a number
+        split as "GGE 123 ZY" is recombined into "GGE123ZY").
         """
         if not _HAS_TESSERACT:
-            return ("", 0.0)
+            return []
 
-        config = (
-            f"--psm {self.psm} "
-            f"-c tessedit_char_whitelist={self.whitelist}"
-        )
-
+        config = f"--psm {psm} -c tessedit_char_whitelist={self.whitelist}"
         try:
-            # Get detailed data for confidence
             data = pytesseract.image_to_data(
                 image, config=config, output_type=pytesseract.Output.DICT
             )
         except Exception as e:
             logger.error("Tesseract failed: %s", e)
-            return ("", 0.0)
+            return []
 
-        # Collect text and confidences
-        text_parts = []
-        confidences = []
-
+        candidates: List[Tuple[str, float]] = []
+        # Group words by text line so multi-token numbers recombine.
+        lines: dict = {}
         for i, word in enumerate(data["text"]):
-            conf = int(data["conf"][i])
+            conf = self._to_float(data["conf"][i])
             word = word.strip()
-            if word and conf > 0:
-                text_parts.append(word)
-                confidences.append(conf)
+            if not word or conf <= 0:
+                continue
+            # Individual word candidate
+            candidates.append((word, conf))
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(key, {"words": [], "confs": []})
+            lines[key]["words"].append(word)
+            lines[key]["confs"].append(conf)
 
-        raw_text = "".join(text_parts)
-        mean_conf = (
-            sum(confidences) / len(confidences) if confidences else 0.0
-        )
+        for grp in lines.values():
+            joined = "".join(grp["words"])
+            mean_conf = sum(grp["confs"]) / len(grp["confs"])
+            candidates.append((joined, mean_conf))
 
-        return (raw_text, mean_conf)
+        return candidates
 
-    # ── Text normalisation ──────────────────────────────────
+    # ── Scoring ─────────────────────────────────────────────
     @staticmethod
-    def normalize_plate(text: str) -> str:
-        """
-        Normalize OCR output:
-          - uppercase
-          - strip whitespace
-          - keep only alphanumeric characters
-        """
-        text = text.upper().strip()
-        text = re.sub(r"[^A-Z0-9]", "", text)
-        return text
+    def _pattern_rank(text: str) -> int:
+        """Lower is better: index of the first pattern the text matches."""
+        for rank, pat in enumerate(_PLATE_PATTERNS):
+            if pat.fullmatch(text):
+                return rank
+        return len(_PLATE_PATTERNS)
 
     # ── Public API ──────────────────────────────────────────
     def read_plate(
         self, plate_crop: np.ndarray, enhanced: bool = False
     ) -> Tuple[str, float]:
         """
-        Read text from a cropped plate image.
-
-        Args:
-            plate_crop: BGR or grayscale cropped plate image
-            enhanced: if True, use enhanced preprocessing pipeline
+        Read the registration number from a plate crop (or full frame).
 
         Returns:
             (normalized_plate_text, confidence_0_to_100)
         """
-        if enhanced:
-            processed = self.preprocessor.preprocess_for_ocr_enhanced(plate_crop)
-        else:
-            processed = self.preprocessor.preprocess_for_ocr(plate_crop)
+        if plate_crop is None or plate_crop.size == 0:
+            return ("", 0.0)
 
-        raw_text, confidence = self._run_tesseract(processed)
-        plate_text = self.normalize_plate(raw_text)
+        psm_modes = [7, 6, 11] if not enhanced else [11, 6, 7, 8]
+
+        best_text = ""
+        best_conf = 0.0
+        best_rank = len(_PLATE_PATTERNS) + 1
+
+        for binary in self._binarisations(plate_crop):
+            for psm in psm_modes:
+                for raw, conf in self._ocr_candidates(binary, psm):
+                    text = self.normalize_plate(raw)
+                    if len(text) < 4:  # too short to be a plate
+                        continue
+                    rank = self._pattern_rank(text)
+                    # Prefer better pattern match; break ties by confidence.
+                    if rank < best_rank or (rank == best_rank and conf > best_conf):
+                        best_rank = rank
+                        best_text = text
+                        best_conf = conf
 
         logger.info(
-            "OCR result: raw='%s' normalized='%s' confidence=%.1f enhanced=%s",
-            raw_text, plate_text, confidence, enhanced,
+            "OCR result: plate='%s' confidence=%.1f rank=%d enhanced=%s",
+            best_text, best_conf, best_rank, enhanced,
         )
+        return (best_text, best_conf)
 
-        return (plate_text, confidence)
+    # ── Helpers ─────────────────────────────────────────────
+    @staticmethod
+    def normalize_plate(text: str) -> str:
+        """Uppercase and strip to A–Z / 0–9 only."""
+        return re.sub(r"[^A-Z0-9]", "", text.upper().strip())
+
+    @staticmethod
+    def _to_float(value) -> float:
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return -1.0

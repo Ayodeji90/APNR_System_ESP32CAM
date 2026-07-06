@@ -1,12 +1,19 @@
 """
 ANPR System — Plate Detection (OpenCV)
 
-Detects license plate regions in a frame using edge detection +
-contour analysis. Returns the cropped plate image and a confidence score.
+Detects license plate regions in a frame and returns the cropped,
+deskewed plate image plus a confidence score.
+
+Two detection strategies are tried, best result wins:
+  1. Bright-region segmentation (primary) — license plates are bright,
+     high-contrast rectangles; robust for dark/low-light frames where the
+     plate is the dominant lit object.
+  2. Edge + 4-vertex contour (fallback) — classic approach, works when the
+     plate has clean straight edges against a busy background.
 """
 
 import logging
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -18,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class PlateDetector:
-    """Detects license plate regions using OpenCV contour analysis."""
+    """Detects license plate regions using OpenCV."""
 
     def __init__(self, cfg: AppConfig):
         self.preprocessor = ImagePreprocessor(cfg)
@@ -36,64 +43,22 @@ class PlateDetector:
         Returns:
             (plate_crop, confidence)
             - plate_crop: cropped & perspective-corrected plate image, or None
-            - confidence: 0.0–1.0 based on contour quality
+            - confidence: 0.0–1.0
         """
-        # Resize for consistent processing
         resized = self.preprocessor.resize(frame, self.target_width)
-        h_frame, w_frame = resized.shape[:2]
-        frame_area = h_frame * w_frame
+        frame_area = resized.shape[0] * resized.shape[1]
 
-        # Edge detection
-        edges = self.preprocessor.preprocess_for_detection(frame)
+        # Strategy 1: bright-region segmentation (primary)
+        crop_b, conf_b = self._detect_bright(resized, frame_area)
+        # Strategy 2: edge + 4-vertex contour (fallback)
+        crop_e, conf_e = self._detect_edges(resized, frame_area)
 
-        # Find contours
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        # Sort by area (largest first) and take top candidates
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:30]
-
-        best_plate: Optional[np.ndarray] = None
-        best_confidence: float = 0.0
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < self.min_area:
-                continue
-
-            # Approximate to polygon
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.018 * peri, True)
-
-            # License plates are roughly rectangular (4 vertices)
-            if len(approx) != 4:
-                continue
-
-            # Check aspect ratio of bounding rectangle
-            x, y, w, h = cv2.boundingRect(approx)
-            if h == 0:
-                continue
-            aspect = w / h
-
-            if not (self.aspect_min <= aspect <= self.aspect_max):
-                continue
-
-            # Perspective transform to flatten the plate
-            plate_crop = self._four_point_transform(resized, approx)
-            if plate_crop is None:
-                continue
-
-            # Confidence: ratio of plate area to frame area (clamped 0–1)
-            confidence = min(area / frame_area * 10, 1.0)
-
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_plate = plate_crop
-                logger.debug(
-                    "Plate candidate: area=%d aspect=%.2f conf=%.2f",
-                    area, aspect, confidence,
-                )
+        if conf_b >= conf_e and crop_b is not None:
+            best_plate, best_confidence = crop_b, conf_b
+        elif crop_e is not None:
+            best_plate, best_confidence = crop_e, conf_e
+        else:
+            best_plate, best_confidence = crop_b, conf_b
 
         if best_plate is not None:
             logger.info("Plate detected — confidence=%.2f", best_confidence)
@@ -102,6 +67,103 @@ class PlateDetector:
 
         return best_plate, best_confidence
 
+    # ── Strategy 1: bright-region segmentation ──────────────
+    def _detect_bright(
+        self, resized: np.ndarray, frame_area: int
+    ) -> Tuple[Optional[np.ndarray], float]:
+        """Find the plate as the dominant bright rectangular region."""
+        gray = self.preprocessor.clahe(resized)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Fill gaps so the plate becomes one solid blob
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+        best_crop: Optional[np.ndarray] = None
+        best_conf = 0.0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.min_area:
+                continue
+
+            # minAreaRect handles rotation/skew directly
+            rect = cv2.minAreaRect(contour)
+            (w, h) = rect[1]
+            if min(w, h) == 0:
+                continue
+            aspect = max(w, h) / min(w, h)
+            if not (self.aspect_min <= aspect <= self.aspect_max):
+                continue
+
+            box = cv2.boxPoints(rect)
+            crop = self._four_point_transform(resized, box)
+            if crop is None:
+                continue
+
+            # Confidence from how much of the frame the plate fills.
+            # A real plate fills a large fraction; junk contours don't.
+            fill = area / frame_area
+            conf = float(np.clip(0.3 + fill * 1.5, 0.0, 1.0))
+            if conf > best_conf:
+                best_conf = conf
+                best_crop = crop
+                logger.debug(
+                    "Bright candidate: area=%d aspect=%.2f fill=%.2f conf=%.2f",
+                    area, aspect, fill, conf,
+                )
+
+        return best_crop, best_conf
+
+    # ── Strategy 2: edge + 4-vertex contour ─────────────────
+    def _detect_edges(
+        self, resized: np.ndarray, frame_area: int
+    ) -> Tuple[Optional[np.ndarray], float]:
+        """Classic edge-based detection: 4-vertex rectangular contour."""
+        gray = self.preprocessor.clahe(resized)
+        gray = self.preprocessor.bilateral_filter(gray)
+        edges = self.preprocessor.canny_edges(gray)
+
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:30]
+
+        best_crop: Optional[np.ndarray] = None
+        best_conf = 0.0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.min_area:
+                continue
+
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+
+            x, y, w, h = cv2.boundingRect(approx)
+            if h == 0:
+                continue
+            aspect = w / h
+            if not (self.aspect_min <= aspect <= self.aspect_max):
+                continue
+
+            crop = self._four_point_transform(resized, approx)
+            if crop is None:
+                continue
+
+            fill = area / frame_area
+            conf = float(np.clip(0.3 + fill * 1.5, 0.0, 1.0))
+            if conf > best_conf:
+                best_conf = conf
+                best_crop = crop
+
+        return best_crop, best_conf
+
     # ── Perspective transform ───────────────────────────────
     @staticmethod
     def _four_point_transform(
@@ -109,10 +171,9 @@ class PlateDetector:
     ) -> Optional[np.ndarray]:
         """
         Apply a perspective transform to extract a rectangular region
-        defined by 4 points.
+        defined by 4 points (any order).
         """
         try:
-            # Reshape points
             pts = pts.reshape(4, 2).astype(np.float32)
 
             # Order points: top-left, top-right, bottom-right, bottom-left
@@ -124,7 +185,6 @@ class PlateDetector:
             rect[1] = pts[np.argmin(diff)]
             rect[3] = pts[np.argmax(diff)]
 
-            # Compute width & height of the new image
             width_a = np.linalg.norm(rect[2] - rect[3])
             width_b = np.linalg.norm(rect[1] - rect[0])
             max_width = max(int(width_a), int(width_b))

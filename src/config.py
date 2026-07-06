@@ -37,8 +37,8 @@ _DEFAULTS = {
         "use_relay": False,
     },
     "detection": {
-        "min_detection_confidence": 0.5,
-        "min_ocr_confidence": 60,
+        "min_detection_confidence": 0.4,
+        "min_ocr_confidence": 40,
         "max_retries": 3,
         "preprocessing_width": 800,
         "plate_aspect_min": 2.0,
@@ -127,8 +127,8 @@ class ActuatorConfig:
 
 @dataclass
 class DetectionConfig:
-    min_detection_confidence: float = 0.5
-    min_ocr_confidence: float = 60
+    min_detection_confidence: float = 0.4
+    min_ocr_confidence: float = 40
     max_retries: int = 3
     preprocessing_width: int = 800
     plate_aspect_min: float = 2.0
