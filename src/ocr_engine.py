@@ -45,12 +45,82 @@ _PLATE_PATTERNS = [
 
 
 class OcrEngine:
-    """Tesseract-based OCR for licence-plate text reading."""
+    """
+    Licence-plate OCR with a pluggable backend.
+
+    Backends (``ocr.engine`` in config):
+      - "easyocr"   — deep-learning OCR; far better on stylised / low-light
+                      plates than Tesseract. Recommended.
+      - "tesseract" — classic engine; fast, but weak on decorative fonts.
+
+    Either way the input is first reduced to the colour-isolated registration
+    strip (region names / slogans removed), and every result is validated
+    against the Nigerian plate pattern before it can be accepted.
+    """
 
     def __init__(self, cfg: AppConfig):
         self.psm = cfg.ocr.tesseract_psm
         self.whitelist = cfg.ocr.char_whitelist
+        self.engine = (cfg.ocr.engine or "tesseract").lower()
+        self._easyocr_gpu = getattr(cfg.ocr, "easyocr_gpu", False)
         self.preprocessor = ImagePreprocessor(cfg)
+        self._easyocr_reader = None  # lazy-initialised singleton
+
+        if self.engine == "easyocr":
+            # Warm the reader up front so the first gate event isn't slow.
+            self._get_easyocr()
+
+    # ── EasyOCR backend ─────────────────────────────────────
+    def _get_easyocr(self):
+        """Lazily build the EasyOCR reader. Returns the reader or None."""
+        if self._easyocr_reader is None:
+            try:
+                import easyocr
+                self._easyocr_reader = easyocr.Reader(["en"], gpu=self._easyocr_gpu)
+                logger.info("EasyOCR reader ready (gpu=%s)", self._easyocr_gpu)
+            except Exception as e:
+                logger.error(
+                    "EasyOCR unavailable (%s) — falling back to Tesseract. "
+                    "Install: pip install easyocr", e,
+                )
+                self._easyocr_reader = False  # sentinel: tried, failed
+        return self._easyocr_reader or None
+
+    def _easyocr_candidates(self, image: np.ndarray) -> List[Tuple[str, float, float]]:
+        """
+        Run EasyOCR and return (text, confidence_0_100, height_px) candidates:
+        each detected box, plus a left-to-right concatenation of all boxes
+        (so a number split as "GGE" "123ZY" recombines into "GGE123ZY").
+        """
+        reader = self._get_easyocr()
+        if reader is None:
+            return []
+        try:
+            results = reader.readtext(
+                image, allowlist=self.whitelist, detail=1, paragraph=False
+            )
+        except Exception as e:
+            logger.error("EasyOCR failed: %s", e)
+            return []
+
+        candidates: List[Tuple[str, float, float]] = []
+        boxes = []
+        for bbox, text, conf in results:
+            ys = [p[1] for p in bbox]
+            xs = [p[0] for p in bbox]
+            height = max(ys) - min(ys)
+            candidates.append((text, float(conf) * 100.0, float(height)))
+            boxes.append((min(xs), text, float(conf), height))
+
+        # Concatenate all boxes left-to-right as one more candidate.
+        if len(boxes) > 1:
+            boxes.sort(key=lambda b: b[0])
+            joined = "".join(b[1] for b in boxes)
+            mean_conf = sum(b[2] for b in boxes) / len(boxes) * 100.0
+            max_h = max(b[3] for b in boxes)
+            candidates.append((joined, mean_conf, max_h))
+
+        return candidates
 
     # ── Colour-segmented registration number (primary path) ─
     def isolate_number_strip(self, bgr: np.ndarray) -> Optional[np.ndarray]:
@@ -248,34 +318,47 @@ class OcrEngine:
                 return rank
         return len(_PLATE_PATTERNS)
 
+    # ── Candidate generation (engine-specific) ──────────────
+    def _candidates_for_image(self, image: np.ndarray, enhanced: bool):
+        """Yield (text, conf, height) candidates for one image, per backend."""
+        if self.engine == "easyocr" and self._get_easyocr() is not None:
+            # Feed EasyOCR the colour-isolated number strip first (region
+            # names already removed), then the colour image as backup.
+            strip = self.isolate_number_strip(image)
+            sources = ([strip] if strip is not None else []) + [image]
+            for src in sources:
+                yield from self._easyocr_candidates(src)
+        else:
+            # Tesseract: many binarisations × PSM modes.
+            psm_modes = [7, 6, 11] if not enhanced else [11, 6, 7, 8]
+            for binary in self._binarisations(image):
+                for psm in psm_modes:
+                    yield from self._ocr_candidates(binary, psm)
+
     # ── Scoring over one image ──────────────────────────────
     def _score_image(self, image: np.ndarray, enhanced: bool):
         """
-        Run every binarisation × PSM over one image and return the best
-        candidate as (text, confidence, key), where lower key is better.
+        Score every candidate for one image and return the best as
+        (text, confidence, key), where lower key is better.
         """
-        psm_modes = [7, 6, 11] if not enhanced else [11, 6, 7, 8]
-
         best_text = ""
         best_conf = 0.0
         best_key = None  # (rank, -height, -conf); lower is better
 
-        for binary in self._binarisations(image):
-            for psm in psm_modes:
-                for raw, conf, height in self._ocr_candidates(binary, psm):
-                    text = self.normalize_plate(raw)
-                    if len(text) < 4:  # too short to be a plate
-                        continue
-                    rank = self._pattern_rank(text)
-                    # Prefer a real plate-pattern match first; then the
-                    # TALLEST text (the registration number dominates the
-                    # plate); then confidence. Height selection stops small
-                    # high-confidence text like "LAGOS" from winning.
-                    key = (rank, -height, -conf)
-                    if best_key is None or key < best_key:
-                        best_key = key
-                        best_text = text
-                        best_conf = conf
+        for raw, conf, height in self._candidates_for_image(image, enhanced):
+            text = self.normalize_plate(raw)
+            if len(text) < 4:  # too short to be a plate
+                continue
+            rank = self._pattern_rank(text)
+            # Prefer a real plate-pattern match first; then the TALLEST text
+            # (the registration number dominates the plate); then confidence.
+            # Height selection stops small high-confidence text like "LAGOS"
+            # from winning.
+            key = (rank, -height, -conf)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_text = text
+                best_conf = conf
 
         return best_text, best_conf, best_key
 

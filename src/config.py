@@ -48,6 +48,7 @@ _DEFAULTS = {
     },
     "ocr": {
         "engine": "tesseract",
+        "easyocr_gpu": False,
         "tesseract_psm": 7,
         "char_whitelist": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
     },
@@ -140,7 +141,8 @@ class DetectionConfig:
 
 @dataclass
 class OcrConfig:
-    engine: str = "tesseract"
+    engine: str = "tesseract"       # "easyocr" (recommended) or "tesseract"
+    easyocr_gpu: bool = False       # set True only if the VM has a CUDA GPU
     tesseract_psm: int = 7
     char_whitelist: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 

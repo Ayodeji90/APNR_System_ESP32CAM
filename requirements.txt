@@ -7,4 +7,6 @@ numpy>=1.21
 requests>=2.28
 pytest>=7.0
 python-telegram-bot>=21.0,<22.0
+# Deep-learning OCR backend (ocr.engine: easyocr). Pulls in torch (~1GB).
+easyocr>=1.7
 

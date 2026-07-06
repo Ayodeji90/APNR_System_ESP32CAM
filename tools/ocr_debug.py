@@ -120,27 +120,23 @@ def _whitelist_match(cfg, text: str):
 
 
 def _dump_candidates(ocr, image, label: str) -> None:
-    """Print every OCR candidate from every binarisation × PSM combo."""
-    print(f"\n--- ALL raw candidates on {label} ---")
+    """Print every OCR candidate the active backend produces for this image."""
+    print(f"\n--- ALL raw candidates on {label} (engine={ocr.engine}) ---")
     seen = {}
-    for bi, binary in enumerate(ocr._binarisations(image)):
-        for psm in (7, 6, 11, 8):
-            for raw, conf, height in ocr._ocr_candidates(binary, psm):
-                text = ocr.normalize_plate(raw)
-                if len(text) < 4:
-                    continue
-                rank = ocr._pattern_rank(text)
-                # keep the best-scoring appearance of each distinct text
-                key = (rank, -height, -conf)
-                if text not in seen or key < seen[text][0]:
-                    seen[text] = (key, conf, height, rank, bi, psm)
+    for raw, conf, height in ocr._candidates_for_image(image, enhanced=True):
+        text = ocr.normalize_plate(raw)
+        if len(text) < 4:
+            continue
+        rank = ocr._pattern_rank(text)
+        key = (rank, -height, -conf)
+        if text not in seen or key < seen[text][0]:
+            seen[text] = (key, conf, height, rank)
     if not seen:
         print("  (no candidates ≥4 chars)")
         return
     # Sort by the same key the engine uses to pick the winner
-    for text, (key, conf, height, rank, bi, psm) in sorted(seen.items(), key=lambda kv: kv[1][0]):
-        print(f"  '{text:<10}' rank={rank} height={height:>4.0f}px "
-              f"conf={conf:>5.1f}  [bin#{bi} psm{psm}]")
+    for text, (key, conf, height, rank) in sorted(seen.items(), key=lambda kv: kv[1][0]):
+        print(f"  '{text:<10}' rank={rank} height={height:>4.0f}px conf={conf:>5.1f}")
 
 
 

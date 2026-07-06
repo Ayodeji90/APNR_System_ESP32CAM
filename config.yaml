@@ -42,7 +42,8 @@ detection:
   min_plate_area: 1000
 
 ocr:
-  engine: "tesseract"
+  engine: "easyocr"           # "easyocr" (deep learning — best for stylised plates) or "tesseract"
+  easyocr_gpu: false          # set true only if the VM has a CUDA GPU
   tesseract_psm: 7
   char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
