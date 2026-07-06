@@ -67,16 +67,12 @@ class DecisionEngine:
             logger.info("Decision: UNKNOWN — %s", reason)
             return DecisionResult(Decision.UNKNOWN, plate_text, reason)
 
-        # Low OCR confidence
-        if ocr_confidence < self.min_ocr_conf:
-            reason = (
-                f"OCR confidence too low "
-                f"({ocr_confidence:.1f} < {self.min_ocr_conf:.1f})"
-            )
-            logger.info("Decision: UNKNOWN — %s", reason)
-            return DecisionResult(Decision.UNKNOWN, plate_text, reason)
-
-        # Check whitelist (exact, then fuzzy to absorb OCR errors)
+        # Whitelist match (exact, then fuzzy to absorb OCR errors) is checked
+        # BEFORE the OCR-confidence gate: a match against a known plate is
+        # stronger evidence than Tesseract's confidence score, which is
+        # unreliable on stylised / low-light plates (it reports near-zero
+        # even for correct reads off the colour-isolated masks). The
+        # fuzzy-distance knob controls how strict the match must be.
         match = self.db.find_whitelist_match(plate_text, self.fuzzy_distance)
         if match:
             if match == plate_text:
@@ -86,7 +82,16 @@ class DecisionEngine:
             logger.info("Decision: ALLOW — %s", reason)
             return DecisionResult(Decision.ALLOW, match, reason)
 
-        # Not on whitelist
+        # Not whitelisted. Use OCR confidence only to distinguish a confident
+        # DENY from an uncertain UNKNOWN — it never blocks a whitelist match.
+        if ocr_confidence < self.min_ocr_conf:
+            reason = (
+                f"Plate {plate_text} not recognised (OCR confidence "
+                f"{ocr_confidence:.1f} < {self.min_ocr_conf:.1f})"
+            )
+            logger.info("Decision: UNKNOWN — %s", reason)
+            return DecisionResult(Decision.UNKNOWN, plate_text, reason)
+
         reason = f"Plate {plate_text} is NOT on the whitelist"
         logger.info("Decision: DENY — %s", reason)
         return DecisionResult(Decision.DENY, plate_text, reason)

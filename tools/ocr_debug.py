@@ -79,21 +79,31 @@ def main() -> None:
     if crop is not None:
         _dump_candidates(ocr, frame, "full frame")
 
-    # ── OCR (crop, then full-frame fallback) ────────────────
-    print("\n--- OCR on detected crop ---")
-    text, conf = (ocr.read_plate(crop, enhanced=True) if crop is not None else ("", 0.0))
-    print(f"  plate='{text}'  ocr_conf={conf:.1f}")
+    # ── Pipeline result: best of crop + full frame (matches app.py) ──
+    text, conf = ocr.read_best([crop, frame], enhanced=True)
 
-    if not text:
-        print("\n--- OCR on full frame (fallback) ---")
-        text, conf = ocr.read_plate(frame, enhanced=True)
-        print(f"  plate='{text}'  ocr_conf={conf:.1f}")
-
-    print("\n=== FINAL ===")
+    print("\n=== FINAL (matches live pipeline) ===")
     print(f"  plate_text = '{text}'")
     print(f"  ocr_conf   = {conf:.1f}   (min_ocr_confidence={cfg.detection.min_ocr_confidence})")
-    print(f"  whitelisted = {ocr.normalize_plate(text) and _whitelisted(cfg, text)}")
+    match = _whitelist_match(cfg, text)
+    fd = cfg.detection.whitelist_fuzzy_distance
+    if match and match == text:
+        print(f"  whitelist  = EXACT match '{match}'  → ALLOW")
+    elif match:
+        print(f"  whitelist  = FUZZY match '{match}' (within {fd} edits)  → ALLOW")
+    else:
+        print(f"  whitelist  = no match within {fd} edits  → DENY/UNKNOWN")
     print()
+
+
+def _whitelist_match(cfg, text: str):
+    if not text:
+        return None
+    try:
+        from src.database import Database
+        return Database(cfg).find_whitelist_match(text, cfg.detection.whitelist_fuzzy_distance)
+    except Exception:
+        return None
 
 
 def _dump_candidates(ocr, image, label: str) -> None:
@@ -120,12 +130,6 @@ def _dump_candidates(ocr, image, label: str) -> None:
               f"conf={conf:>5.1f}  [bin#{bi} psm{psm}]")
 
 
-def _whitelisted(cfg, text: str) -> bool:
-    try:
-        from src.database import Database
-        return Database(cfg).is_whitelisted(text)
-    except Exception:
-        return False
 
 
 if __name__ == "__main__":

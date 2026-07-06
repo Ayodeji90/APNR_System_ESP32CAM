@@ -55,9 +55,16 @@ class TestDecisionEngine:
         result = engine.decide("ABC123", ocr_confidence=90, detection_confidence=0.1)
         assert result.decision == Decision.UNKNOWN
 
-    def test_unknown_low_ocr_conf(self, engine):
-        result = engine.decide("ABC123", ocr_confidence=20, detection_confidence=0.8)
+    def test_unknown_low_ocr_conf_not_whitelisted(self, engine):
+        # Low OCR confidence on an UNKNOWN plate → UNKNOWN (uncertain read).
+        result = engine.decide("NOTHERE1", ocr_confidence=20, detection_confidence=0.8)
         assert result.decision == Decision.UNKNOWN
+
+    def test_allow_whitelisted_ignores_low_ocr_conf(self, engine):
+        # A whitelist match is stronger evidence than Tesseract's confidence,
+        # which is unreliable on stylised plates — so it opens even at low conf.
+        result = engine.decide("ABC123", ocr_confidence=4, detection_confidence=0.8)
+        assert result.decision == Decision.ALLOW
 
     def test_boundary_detection_conf(self, engine):
         # Exactly at threshold
