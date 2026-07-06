@@ -194,27 +194,15 @@ def api_detect():
     detection_conf = 0.0
 
     # ── Detect plate region, then OCR ───────────────────────
+    # OCR both the localised crop AND the full frame, letting the scorer
+    # choose. The tight crop sometimes clips the first/last character while
+    # the full frame keeps them (and vice-versa), so trying both is robust.
     plate_crop, detection_conf = detector.detect(frame)
+    plate_text, ocr_conf = ocr.read_best([plate_crop, frame], enhanced=True)
 
-    if plate_crop is not None:
-        # OCR the localised crop — standard pass, then enhanced.
-        text, conf = ocr.read_plate(plate_crop, enhanced=False)
-        if conf < _cfg.detection.min_ocr_confidence:
-            text2, conf2 = ocr.read_plate(plate_crop, enhanced=True)
-            if conf2 > conf:
-                text, conf = text2, conf2
-        plate_text, ocr_conf = text, conf
-
-    # ── Full-frame fallback ─────────────────────────────────
-    # If localisation failed or produced no readable text, OCR the whole
-    # (contrast-boosted) frame. Assign a mid detection score so a strong,
-    # whitelisted read can still open the gate.
-    if not plate_text:
-        logger.info("Crop OCR empty — falling back to full-frame OCR")
-        text, conf = ocr.read_plate(frame, enhanced=True)
-        if text:
-            plate_text, ocr_conf = text, conf
-            detection_conf = max(detection_conf, _cfg.detection.min_detection_confidence)
+    if plate_text and detection_conf < _cfg.detection.min_detection_confidence:
+        # A confident read with weak localisation — let it through the gate.
+        detection_conf = _cfg.detection.min_detection_confidence
 
     # ── Decision ────────────────────────────────────────────
     result = decision_engine.decide(plate_text, ocr_conf, detection_conf)

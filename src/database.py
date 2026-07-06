@@ -63,6 +63,27 @@ CREATE TABLE IF NOT EXISTS pending_commands (
 """
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """Edit distance between two strings (insertions/deletions/substitutions)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(
+                prev[j] + 1,        # deletion
+                cur[j - 1] + 1,     # insertion
+                prev[j - 1] + (ca != cb),  # substitution
+            ))
+        prev = cur
+    return prev[-1]
+
+
 class Database:
     """Thin wrapper around SQLite for the ANPR system."""
 
@@ -149,6 +170,38 @@ class Database:
                 "SELECT * FROM vehicles WHERE active = 1 ORDER BY plate_text"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def find_whitelist_match(
+        self, plate_text: str, max_distance: int = 0
+    ) -> Optional[str]:
+        """
+        Find a whitelisted plate matching *plate_text*.
+
+        Exact match first; if none and max_distance > 0, return the closest
+        active plate within *max_distance* edits (Levenshtein). This absorbs
+        the 1–2 character OCR errors typical of stylised plates in low light.
+        Returns the matched whitelist plate, or None.
+        """
+        plate = plate_text.upper().strip()
+        if not plate:
+            return None
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT plate_text FROM vehicles WHERE active = 1"
+            ).fetchall()
+        plates = [r["plate_text"] for r in rows]
+
+        if plate in plates:
+            return plate
+        if max_distance <= 0:
+            return None
+
+        best, best_dist = None, max_distance + 1
+        for wp in plates:
+            d = _levenshtein(plate, wp)
+            if d < best_dist:
+                best, best_dist = wp, d
+        return best if best_dist <= max_distance else None
 
     # ── Event Logging ───────────────────────────────────────
     def log_event(

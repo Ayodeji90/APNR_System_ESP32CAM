@@ -39,6 +39,7 @@ _DEFAULTS = {
     "detection": {
         "min_detection_confidence": 0.4,
         "min_ocr_confidence": 40,
+        "whitelist_fuzzy_distance": 2,
         "max_retries": 3,
         "preprocessing_width": 800,
         "plate_aspect_min": 1.3,
@@ -129,6 +130,7 @@ class ActuatorConfig:
 class DetectionConfig:
     min_detection_confidence: float = 0.4
     min_ocr_confidence: float = 40
+    whitelist_fuzzy_distance: int = 2
     max_retries: int = 3
     preprocessing_width: int = 800
     plate_aspect_min: float = 1.3

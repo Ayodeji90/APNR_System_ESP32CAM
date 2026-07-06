@@ -100,7 +100,11 @@ class PlateDetector:
             if not (self.aspect_min <= aspect <= self.aspect_max):
                 continue
 
-            box = cv2.boxPoints(rect)
+            # Pad the rect ~14% so edge characters aren't clipped
+            # (the first/last plate character often sits right at the border).
+            (cx, cy), (rw, rh), ang = rect
+            padded = ((cx, cy), (rw * 1.14, rh * 1.14), ang)
+            box = cv2.boxPoints(padded)
             crop = self._four_point_transform(resized, box)
             if crop is None:
                 continue

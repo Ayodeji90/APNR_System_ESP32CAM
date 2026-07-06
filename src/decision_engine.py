@@ -33,6 +33,7 @@ class DecisionEngine:
     def __init__(self, cfg: AppConfig, db: Database):
         self.min_detection_conf = cfg.detection.min_detection_confidence
         self.min_ocr_conf = cfg.detection.min_ocr_confidence
+        self.fuzzy_distance = cfg.detection.whitelist_fuzzy_distance
         self.db = db
 
     def decide(
@@ -75,11 +76,15 @@ class DecisionEngine:
             logger.info("Decision: UNKNOWN — %s", reason)
             return DecisionResult(Decision.UNKNOWN, plate_text, reason)
 
-        # Check whitelist
-        if self.db.is_whitelisted(plate_text):
-            reason = f"Plate {plate_text} is on the whitelist"
+        # Check whitelist (exact, then fuzzy to absorb OCR errors)
+        match = self.db.find_whitelist_match(plate_text, self.fuzzy_distance)
+        if match:
+            if match == plate_text:
+                reason = f"Plate {plate_text} is on the whitelist"
+            else:
+                reason = f"Plate {plate_text} matched whitelist entry {match} (fuzzy)"
             logger.info("Decision: ALLOW — %s", reason)
-            return DecisionResult(Decision.ALLOW, plate_text, reason)
+            return DecisionResult(Decision.ALLOW, match, reason)
 
         # Not on whitelist
         reason = f"Plate {plate_text} is NOT on the whitelist"

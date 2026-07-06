@@ -156,26 +156,19 @@ class OcrEngine:
                 return rank
         return len(_PLATE_PATTERNS)
 
-    # ── Public API ──────────────────────────────────────────
-    def read_plate(
-        self, plate_crop: np.ndarray, enhanced: bool = False
-    ) -> Tuple[str, float]:
+    # ── Scoring over one image ──────────────────────────────
+    def _score_image(self, image: np.ndarray, enhanced: bool):
         """
-        Read the registration number from a plate crop (or full frame).
-
-        Returns:
-            (normalized_plate_text, confidence_0_to_100)
+        Run every binarisation × PSM over one image and return the best
+        candidate as (text, confidence, key), where lower key is better.
         """
-        if plate_crop is None or plate_crop.size == 0:
-            return ("", 0.0)
-
         psm_modes = [7, 6, 11] if not enhanced else [11, 6, 7, 8]
 
         best_text = ""
         best_conf = 0.0
         best_key = None  # (rank, -height, -conf); lower is better
 
-        for binary in self._binarisations(plate_crop):
+        for binary in self._binarisations(image):
             for psm in psm_modes:
                 for raw, conf, height in self._ocr_candidates(binary, psm):
                     text = self.normalize_plate(raw)
@@ -192,10 +185,40 @@ class OcrEngine:
                         best_text = text
                         best_conf = conf
 
+        return best_text, best_conf, best_key
+
+    # ── Public API ──────────────────────────────────────────
+    def read_plate(
+        self, plate_crop: np.ndarray, enhanced: bool = False
+    ) -> Tuple[str, float]:
+        """Read the registration number from a single image."""
+        if plate_crop is None or plate_crop.size == 0:
+            return ("", 0.0)
+        text, conf, _ = self._score_image(plate_crop, enhanced)
         logger.info(
             "OCR result: plate='%s' confidence=%.1f enhanced=%s",
-            best_text, best_conf, enhanced,
+            text, conf, enhanced,
         )
+        return (text, conf)
+
+    def read_best(self, images, enhanced: bool = True) -> Tuple[str, float]:
+        """
+        Read from several images (e.g. the tight crop AND the full frame)
+        and return the single best result. The crop sometimes clips edge
+        characters while the full frame keeps them, so trying both and
+        letting the scorer choose is more robust than either alone.
+        """
+        best_text = ""
+        best_conf = 0.0
+        best_key = None
+        for image in images:
+            if image is None or image.size == 0:
+                continue
+            text, conf, key = self._score_image(image, enhanced)
+            if key is not None and (best_key is None or key < best_key):
+                best_key, best_text, best_conf = key, text, conf
+        logger.info("OCR best-of-%d: plate='%s' confidence=%.1f",
+                    len(images), best_text, best_conf)
         return (best_text, best_conf)
 
     # ── Helpers ─────────────────────────────────────────────
