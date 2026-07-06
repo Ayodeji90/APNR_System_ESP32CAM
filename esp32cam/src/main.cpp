@@ -52,12 +52,12 @@
 
 // ── Configuration ────────────────────────────────────────────
 // WiFi credentials — CHANGE THESE for your network
-const char* WIFI_SSID     = "Airtel_W304VA PRO_7E5A_5G";
-const char* WIFI_PASSWORD = "07048283747";
+const char* WIFI_SSID     = "Raspberrypi";
+const char* WIFI_PASSWORD = "08084835102";
 
 // Server URL — your GCP VM's public IP or domain
 // This is where the ESP32 POSTs images and heartbeats.
-const char* SERVER_BASE_URL = "http://YOUR_VM_IP:5000";
+const char* SERVER_BASE_URL = "http://136.115.40.189:5000";
 
 // API key — must match esp32.api_key in the server's config.yaml
 const char* API_KEY = "3b01f25b914defb99bbb4aaca51f1f2de7fb7c66e3c47116";

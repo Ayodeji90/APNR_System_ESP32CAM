@@ -204,9 +204,11 @@ def api_detect():
             if attempt < max_retries:
                 logger.info("No plate found (attempt %d/%d) — retrying", attempt + 1, max_retries)
                 continue
-            reason = f"No plate detected after {max_retries + 1} attempts"
-            decision = Decision.UNKNOWN
-            break
+            # FALLBACK: If we couldn't find a perfect rectangle after all retries,
+            # just pass the entire image to the OCR engine!
+            logger.warning("Falling back to full-frame OCR (no plate border detected)")
+            plate_crop = frame
+            det_conf = 0.1
 
         detection_conf = det_conf
 
