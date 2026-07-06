@@ -64,7 +64,20 @@ def main() -> None:
         print("No crop detected — will OCR full frame.")
         target = frame
 
-    # Save the first binarisation Tesseract sees (for visual inspection).
+    # Save the colour-isolated number strip (the primary OCR input).
+    strip = ocr.isolate_number_strip(target if crop is not None else frame)
+    if strip is None and crop is not None:
+        strip = ocr.isolate_number_strip(frame)
+    if strip is not None:
+        cv2.imwrite(base + ".debug_strip.jpg", strip)
+        print(f"Isolated number strip saved: {base}.debug_strip.jpg  ({strip.shape[1]}x{strip.shape[0]})")
+        st_text, st_conf, _ = ocr._score_image(strip, enhanced=True)
+        print(f"  strip OCR → '{ocr.normalize_plate(st_text)}'  conf={st_conf:.1f}")
+    else:
+        print("Number strip: could NOT isolate purple characters "
+              "(check the hue range or lighting).")
+
+    # Save the first full binarisation too (for visual inspection).
     try:
         bins = ocr._binarisations(target)
         cv2.imwrite(base + ".debug_bin.jpg", bins[0])

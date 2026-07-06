@@ -14,7 +14,7 @@ image.  Robust to dark, stylised, multi-line plates:
 
 import re
 import logging
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import cv2
 import numpy as np
@@ -52,6 +52,84 @@ class OcrEngine:
         self.whitelist = cfg.ocr.char_whitelist
         self.preprocessor = ImagePreprocessor(cfg)
 
+    # ── Colour-segmented registration number (primary path) ─
+    def isolate_number_strip(self, bgr: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Isolate ONLY the registration number by colour + geometry.
+
+        The Nigerian plate's registration number is the single block of large
+        PURPLE characters; the region name ("LAGOS"), slogan, map and hills are
+        black/green/white. We mask the purple, keep the tall character blobs
+        that sit on one horizontal line (the number band), and return a clean
+        binary strip (dark chars on white) containing just that number — so
+        Tesseract never sees "LAGOS" at all.
+
+        Returns the strip, or None if the number couldn't be isolated.
+        """
+        if bgr is None or bgr.ndim != 3:
+            return None
+        H, W = bgr.shape[:2]
+        if H < 20 or W < 20:
+            return None
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        # Purple / violet / blue-violet registration characters. Wide hue
+        # band + modest saturation so it survives low light and colour cast.
+        mask = cv2.inRange(hsv, (105, 45, 40), (165, 255, 255))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        comps = []
+        for i in range(1, num):
+            x, y, w, h, area = stats[i]
+            # Character-sized purple blobs: exclude specks and full-width smears.
+            if h < 0.10 * H or h > 0.95 * H:
+                continue
+            if w > 0.45 * W or area < 15:
+                continue
+            comps.append((x, y, w, h))
+        if len(comps) < 3:      # need at least a few characters
+            return None
+
+        # Cluster components into horizontal lines by vertical centre, then
+        # pick the line with the TALLEST characters — the registration number
+        # is the biggest text on the plate. (On real plates "LAGOS" is black,
+        # so it isn't even in the purple mask; this also rejects stray noise.)
+        comps.sort(key=lambda c: c[1] + c[3] / 2)
+        lines: List[list] = []
+        for c in comps:
+            yc, h = c[1] + c[3] / 2, c[3]
+            for ln in lines:
+                ref = ln[0]
+                if abs(yc - (ref[1] + ref[3] / 2)) <= 0.7 * max(h, ref[3]):
+                    ln.append(c)
+                    break
+            else:
+                lines.append([c])
+        # Best line: most characters, tie-broken by tallest median height.
+        def line_score(ln):
+            hs = sorted(cc[3] for cc in ln)
+            return (len(ln), hs[len(hs) // 2])
+        band = max(lines, key=line_score)
+        if len(band) < 3:
+            return None
+
+        band_h = max(c[3] for c in band)
+        x0 = min(c[0] for c in band)
+        y0 = min(c[1] for c in band)
+        x1 = max(c[0] + c[2] for c in band)
+        y1 = max(c[1] + c[3] for c in band)
+        pad = int(0.12 * band_h)
+        x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+        x1, y1 = min(W, x1 + pad), min(H, y1 + pad)
+
+        strip = mask[y0:y1, x0:x1]
+        strip = cv2.bitwise_not(strip)             # dark chars on white
+        strip = self.preprocessor.upscale_min_width(strip, 500)
+        # slight dilation of the (now dark) strokes for cleaner glyphs
+        strip = cv2.erode(strip, np.ones((2, 2), np.uint8))
+        return strip
+
     # ── Binarisation variants ───────────────────────────────
     def _binarisations(self, plate_crop: np.ndarray) -> List[np.ndarray]:
         """Produce several binary images to feed Tesseract.
@@ -63,6 +141,12 @@ class OcrEngine:
         numbers come out dark-on-light this way.
         """
         variants: List[np.ndarray] = []
+
+        # 0) PRIMARY: colour-segmented registration-number strip (LAGOS and
+        #    all other text already removed — cleanest input for Tesseract).
+        strip = self.isolate_number_strip(plate_crop)
+        if strip is not None:
+            variants.append(strip)
 
         # 1) Luminance path (CLAHE-boosted grayscale)
         gray = self.preprocessor.clahe(plate_crop)
