@@ -54,17 +54,39 @@ class OcrEngine:
 
     # ── Binarisation variants ───────────────────────────────
     def _binarisations(self, plate_crop: np.ndarray) -> List[np.ndarray]:
-        """Produce several binary images to feed Tesseract."""
+        """Produce several binary images to feed Tesseract.
+
+        Includes colour-aware channels: coloured plate characters (e.g. the
+        purple "GGE-123ZY" on Lagos plates) have poor luminance contrast on
+        white, but pop strongly in the green channel or the per-pixel min of
+        the BGR channels. Both black region names and coloured registration
+        numbers come out dark-on-light this way.
+        """
+        variants: List[np.ndarray] = []
+
+        # 1) Luminance path (CLAHE-boosted grayscale)
         gray = self.preprocessor.clahe(plate_crop)
         gray = self.preprocessor.upscale_min_width(gray, 400)
         gray = cv2.bilateralFilter(gray, 11, 17, 17)
-
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         adaptive = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 9
         )
-        # Dark chars on light plate → otsu; light chars on dark → inverted.
-        return [otsu, cv2.bitwise_not(otsu), adaptive]
+        variants += [otsu, cv2.bitwise_not(otsu), adaptive]
+
+        # 2) Colour-aware paths (only for BGR input)
+        if plate_crop.ndim == 3:
+            # Per-pixel min channel: any saturated colour OR black → dark;
+            # white → bright. Great universal "coloured text on white" mask.
+            min_ch = plate_crop.min(axis=2).astype(np.uint8)
+            min_ch = self.preprocessor.upscale_min_width(min_ch, 400)
+            _, o_min = cv2.threshold(min_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Green channel: best contrast specifically for purple/red text.
+            green = self.preprocessor.upscale_min_width(plate_crop[:, :, 1], 400)
+            _, o_green = cv2.threshold(green, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants += [o_min, o_green]
+
+        return variants
 
     # ── Raw OCR over one image ──────────────────────────────
     def _ocr_candidates(self, image: np.ndarray, psm: int) -> List[Tuple[str, float]]:

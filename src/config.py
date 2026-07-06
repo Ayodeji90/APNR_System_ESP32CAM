@@ -41,7 +41,7 @@ _DEFAULTS = {
         "min_ocr_confidence": 40,
         "max_retries": 3,
         "preprocessing_width": 800,
-        "plate_aspect_min": 2.0,
+        "plate_aspect_min": 1.3,
         "plate_aspect_max": 6.0,
         "min_plate_area": 1000,
     },
@@ -131,7 +131,7 @@ class DetectionConfig:
     min_ocr_confidence: float = 40
     max_retries: int = 3
     preprocessing_width: int = 800
-    plate_aspect_min: float = 2.0
+    plate_aspect_min: float = 1.3
     plate_aspect_max: float = 6.0
     min_plate_area: int = 1000
 
