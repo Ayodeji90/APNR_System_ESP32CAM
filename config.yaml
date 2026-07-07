@@ -72,8 +72,8 @@ logging:
 # 3. Set enabled: true and fill in bot_token + allowed_chat_ids.
 telegram:
   enabled: true
-  bot_token: ""               # YOUR BOT TOKEN from BotFather
-  allowed_chat_ids: []        # e.g. [123456789]  numeric chat IDs only
+  bot_token: "8528643172:AAFdQwnVcfCnhQoKQu_SrczrTK8MVR2c-gw"
+  allowed_chat_ids: [7703064261]
   notify_on_allow: true
   notify_on_deny: true
   notify_on_unknown: true

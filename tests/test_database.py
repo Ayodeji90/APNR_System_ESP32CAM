@@ -4,7 +4,7 @@ import os
 import pytest
 
 from src.config import load_config, AppConfig, PathsConfig
-from src.database import Database
+from src.database import Database, _levenshtein
 
 
 @pytest.fixture
@@ -60,6 +60,38 @@ class TestVehicleCRUD:
         upd = [v for v in vehicles if v["plate_text"] == "UPD1"][0]
         assert upd["owner_name"] == "New Name"
         assert upd["access_level"] == "staff"
+
+
+class TestFuzzyWhitelistMatch:
+    """Confusion-aware fuzzy matching absorbs classic OCR errors without
+    loosening the net for genuinely different plates."""
+
+    def test_exact_match(self, db):
+        db.add_vehicle("GGE123ZY")
+        assert db.find_whitelist_match("GGE123ZY", max_distance=0) == "GGE123ZY"
+
+    def test_no_match_beyond_distance(self, db):
+        db.add_vehicle("GGE123ZY")
+        assert db.find_whitelist_match("XYZ999AB", max_distance=2) is None
+
+    def test_fuzzy_match_within_distance(self, db):
+        db.add_vehicle("GGE123ZY")
+        # 2 unrelated substitutions (E/H, 2/7) -- within distance=2
+        assert db.find_whitelist_match("GGH173ZY", max_distance=2) == "GGE123ZY"
+
+    def test_confusable_pair_costs_half(self):
+        # O/0 is a classic OCR confusion -> half-edit, not a full edit
+        assert _levenshtein("ABC1O5XY", "ABC105XY") == 0.5
+
+    def test_unrelated_substitution_costs_full(self):
+        assert _levenshtein("ABCDEFGH", "ABCXYFGH") == 2.0
+
+    def test_tight_distance_forgives_confusable_pair(self, db):
+        # With max_distance=1, a single classic confusion (cost 0.5) still
+        # matches -- letting production tighten the threshold without
+        # losing tolerance for the errors OCR actually makes most often.
+        db.add_vehicle("ABC105XY")
+        assert db.find_whitelist_match("ABC1O5XY", max_distance=1) == "ABC105XY"
 
 
 class TestEventLogging:

@@ -43,6 +43,13 @@ _PLATE_PATTERNS = [
     re.compile(r"[A-Z0-9]{5,9}"),                 # generic alnum fallback
 ]
 
+# HSV range for the standard Nigerian plate's embossed blue/purple
+# registration characters. Single source of truth — used by both
+# isolate_number_strip() and the hue-isolation binarisation variant, so
+# tuning it only needs to happen in one place.
+_PURPLE_HSV_LOW = (100, 40, 40)
+_PURPLE_HSV_HIGH = (165, 255, 255)
+
 
 class OcrEngine:
     """
@@ -145,7 +152,7 @@ class OcrEngine:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         # Purple / violet / blue-violet registration characters. Wide hue
         # band + modest saturation so it survives low light and colour cast.
-        mask = cv2.inRange(hsv, (105, 45, 40), (165, 255, 255))
+        mask = cv2.inRange(hsv, _PURPLE_HSV_LOW, _PURPLE_HSV_HIGH)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
         num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -249,7 +256,7 @@ class OcrEngine:
             # discarding the green state map behind the digits and the black
             # "LAGOS" text. This is what lets "123" read cleanly despite the map.
             hsv = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2HSV)
-            purple = cv2.inRange(hsv, (100, 40, 40), (165, 255, 255))
+            purple = cv2.inRange(hsv, _PURPLE_HSV_LOW, _PURPLE_HSV_HIGH)
             purple = cv2.morphologyEx(
                 purple, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
             )
@@ -323,11 +330,21 @@ class OcrEngine:
         """Yield (text, conf, height) candidates for one image, per backend."""
         if self.engine == "easyocr" and self._get_easyocr() is not None:
             # Feed EasyOCR the colour-isolated number strip first (region
-            # names already removed), then the colour image as backup.
+            # names already removed — the cleanest, most trustworthy input).
             strip = self.isolate_number_strip(image)
-            sources = ([strip] if strip is not None else []) + [image]
-            for src in sources:
-                yield from self._easyocr_candidates(src)
+            strip_candidates = list(self._easyocr_candidates(strip)) if strip is not None else []
+            yield from strip_candidates
+
+            # Only fall back to OCR-ing the raw colour image if the strip
+            # didn't already yield a full plate-pattern match. Skipping this
+            # otherwise saves a full EasyOCR inference pass (the slow part)
+            # AND avoids reintroducing "LAGOS"-shaped text as a candidate.
+            already_matched = any(
+                self._pattern_rank(self.normalize_plate(t)) == 0
+                for t, _, _ in strip_candidates
+            )
+            if not already_matched:
+                yield from self._easyocr_candidates(image)
         else:
             # Tesseract: many binarisations × PSM modes.
             psm_modes = [7, 6, 11] if not enhanced else [11, 6, 7, 8]
@@ -399,18 +416,25 @@ class OcrEngine:
     # ── Helpers ─────────────────────────────────────────────
     @staticmethod
     def normalize_plate(text: str) -> str:
-        """Uppercase, remove common Nigerian plate stopwords, and strip to A-Z / 0-9 only."""
-        text = text.upper()
-        # Aggressively remove variations of state names and slogans
-        text = re.sub(r'(?:[01IO]*LAGOS|CENT[A-Z]*|EXCEL[A-Z]*|FEDER[A-Z]*|REPUBL[A-Z]*|NIGER[A-Z]*|STATE|ABUJA|KANO|RIVERS|OGUN|OYO|KADUNA|EDO|ENUGU|DELTA|KWARA|ONDO|OSUN|PLATEAU)', '', text)
-        
-        normalized = re.sub(r"[^A-Z0-9]", "", text.strip())
-        
-        # A valid Nigerian plate MUST contain at least one digit and at least one letter.
-        # If it doesn't (e.g. "CENTCN", "OLAGOS"), it's definitely garbage text.
-        if not re.search(r'\d', normalized) or not re.search(r'[A-Z]', normalized):
+        """Uppercase and strip to A-Z / 0-9 only.
+
+        Deliberately does NOT strip state-name substrings (e.g. "LAGOS",
+        "EDO", "OYO", "KANO") from the text — several states' real plate
+        codes literally start with their own abbreviation (Edo-state plates
+        commonly begin "EDO...", Oyo-state "OYO...", etc), so blind substring
+        deletion corrupts genuine reads. The digit+letter requirement below
+        is what safely rejects pure region-name/slogan text like "LAGOS" or
+        "FEDERAL REPUBLIC OF NIGERIA" (neither contains a digit) without
+        touching real plate numbers that happen to share a state prefix.
+        """
+        normalized = re.sub(r"[^A-Z0-9]", "", text.upper().strip())
+
+        # A valid plate MUST contain at least one digit and at least one
+        # letter. Pure-letter text ("LAGOS", "CENTREOFEXCELLENCE") or
+        # pure-digit noise is definitely not a plate number.
+        if not re.search(r"\d", normalized) or not re.search(r"[A-Z]", normalized):
             return ""
-            
+
         return normalized
 
     @staticmethod

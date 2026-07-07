@@ -63,22 +63,46 @@ CREATE TABLE IF NOT EXISTS pending_commands (
 """
 
 
-def _levenshtein(a: str, b: str) -> int:
-    """Edit distance between two strings (insertions/deletions/substitutions)."""
+# Character pairs OCR engines routinely confuse with each other. A
+# substitution between two chars in the same pair costs half an edit
+# instead of a full one — so a whitelist_fuzzy_distance of e.g. 1 still
+# forgives a single classic confusion (O/0, I/1, 2/Z, ...) while still
+# rejecting a plate that differs by an unrelated, non-confusable character.
+_CONFUSABLE_PAIRS = {
+    frozenset(p) for p in (
+        "0O", "1I", "1L", "2Z", "5S", "8B", "6G", "9Q", "0Q", "DO",
+    )
+}
+
+
+def _sub_cost(a: str, b: str) -> float:
     if a == b:
-        return 0
+        return 0.0
+    if frozenset((a, b)) in _CONFUSABLE_PAIRS:
+        return 0.5
+    return 1.0
+
+
+def _levenshtein(a: str, b: str) -> float:
+    """
+    Edit distance between two strings, insertions/deletions cost 1 each;
+    substitutions cost 1 except between commonly-confused OCR character
+    pairs (see _CONFUSABLE_PAIRS), which cost 0.5.
+    """
+    if a == b:
+        return 0.0
     if not a:
-        return len(b)
+        return float(len(b))
     if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
+        return float(len(a))
+    prev = [float(j) for j in range(len(b) + 1)]
     for i, ca in enumerate(a, 1):
-        cur = [i]
+        cur = [float(i)]
         for j, cb in enumerate(b, 1):
             cur.append(min(
-                prev[j] + 1,        # deletion
-                cur[j - 1] + 1,     # insertion
-                prev[j - 1] + (ca != cb),  # substitution
+                prev[j] + 1,                      # deletion
+                cur[j - 1] + 1,                   # insertion
+                prev[j - 1] + _sub_cost(ca, cb),  # substitution
             ))
         prev = cur
     return prev[-1]

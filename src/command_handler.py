@@ -185,7 +185,7 @@ class TelegramCommandHandler:
             self._db.queue_command("open", source="telegram")
             await update.message.reply_text(
                 "✅ Gate OPEN command queued.\n"
-                "⏳ The ESP32 will execute it on its next heartbeat (~30s)."
+                "⏳ The ESP32 will execute it on its next heartbeat (~5s)."
             )
             self._log_command(update.effective_chat.id, "open_gate", "", "queued")
             logger.info("Gate open queued via Telegram by chat_id=%s", update.effective_chat.id)
@@ -197,7 +197,7 @@ class TelegramCommandHandler:
             self._db.queue_command("close", source="telegram")
             await update.message.reply_text(
                 "✅ Gate CLOSE command queued.\n"
-                "⏳ The ESP32 will execute it on its next heartbeat (~30s)."
+                "⏳ The ESP32 will execute it on its next heartbeat (~5s)."
             )
             self._log_command(update.effective_chat.id, "close_gate", "", "queued")
         except Exception as exc:
